@@ -1,5 +1,4 @@
 ### AI Employee Dashboard Agent – Technical & Product Spec  
-Access Link: [https://dashboard-agent-799818976326.us-central1.run.app/](url)
 
 #### 1. Current Stack & Infrastructure
 | Layer              | Technology / Choice                                 | Notes |
