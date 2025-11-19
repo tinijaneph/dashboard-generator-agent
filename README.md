@@ -75,9 +75,11 @@ Focus on GCP-native tools for scaling; aim for 30+ concurrent users in 1–2 mon
 
 #### 7. Technical note:
 - Built 
+
 gcloud builds submit   --tag us-central1-docker.pkg.dev/$PROJECT_ID/dashboard-agent/agent:v1   --timeout=20m
 
 - Deploy
+
 gcloud run deploy dashboard-agent   --image us-central1-docker.pkg.dev/$PROJECT_ID/dashboard-agent/agent:v1   --region us-central1   --allow-unauthenticated   --set-env-vars PROJECT_ID=$PROJECT_ID   --memory 2Gi   --cpu 2   --timeout 300
 
 
