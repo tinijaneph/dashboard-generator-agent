@@ -5,7 +5,7 @@ Access Link: [https://dashboard-agent-799818976326.us-central1.run.app/](url)
 | Layer              | Technology / Choice                                 | Notes |
 |--------------------|-----------------------------------------------------|-------|
 | Backend            | FastAPI (Python 3.10+)                              | Lightweight, async-ready |
-| AI Query Parser    | Google Vertex AI → `gemini-1.5-pro-001` (optional) <br>Fallback: rule-based keyword parser | Works even if Vertex AI keys missing |
+| AI Query Parser    | Google Vertex AI → `gemini-1.5-pro-001` <br>Fallback: rule-based keyword parser | Works even if Vertex AI keys missing |
 | Data Layer         | In-memory Pandas DataFrames (cached)                | Fake data generated on first call |
 | Frontend           | Pure HTML + CSS + vanilla JS (no React/Vue)        | Single-page, Claude-style minimal UI |
 | Charts             | Plotly.js 2.27 (via CDN)                            | Responsive, good-looking |
