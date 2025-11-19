@@ -71,3 +71,13 @@ Focus on GCP-native tools for scaling; aim for 30+ concurrent users in 1–2 mon
 | **Enhance (Weeks 1–4)** | 1. Add GCP Secret Manager for Vertex AI keys.<br>2. Integrate Cloud SQL (PostgreSQL) for persistent data/caching (migrate from in-memory).<br>3. Implement IAM-based auth via GCP Identity-Aware Proxy (IAP).<br>4. Add Artifact Registry for Docker images; use Cloud Build for CI/CD.<br>5. Test with real HRIS export (e.g., BigQuery load from Workday CSV). | 1 week per item | Secret Manager, Cloud SQL, IAP, Artifact Registry, Cloud Build, BigQuery | Handles 10–50 users; data persistence across restarts |
 | **Scale (Weeks 5–8)** | 1. Auto-scale Cloud Run to 1000 instances max; set concurrency=80.<br>2. Add Cloud Load Balancer for multi-region (us-central1 → us-east1 failover).<br>3. Use Memorystore (Redis) for session/query caching.<br>4. Monitor with Cloud Monitoring/Logging; set alerts for >80% CPU.<br>5. Enable Cloud CDN for static assets (Plotly CDN already, but cache HTML responses). | 1–2 weeks total | Cloud Run autoscaling, Load Balancer, Memorystore, Monitoring/Logging, CDN | 100–500 users; <200ms latency; cost ~$50–200/mo at scale |
 | **Rollout (Week 9+)** | 1. Beta to 5 HR users.<br>2. Gather feedback via integrated Google Forms.<br>3. Full rollout: Share via GCP custom domain (e.g., hr-dashboard.yourcompany.com).<br>4. Backup: Cloud Run revisions for rollback. | Ongoing | IAP groups, Custom domains | Enterprise-ready; audit logs to BigQuery for compliance |
+
+
+#### 7. Technical note:
+- Built 
+gcloud builds submit   --tag us-central1-docker.pkg.dev/$PROJECT_ID/dashboard-agent/agent:v1   --timeout=20m
+
+- Deploy
+gcloud run deploy dashboard-agent   --image us-central1-docker.pkg.dev/$PROJECT_ID/dashboard-agent/agent:v1   --region us-central1   --allow-unauthenticated   --set-env-vars PROJECT_ID=$PROJECT_ID   --memory 2Gi   --cpu 2   --timeout 300
+
+
