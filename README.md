@@ -7,7 +7,7 @@ Access Link: [https://dashboard-agent-799818976326.us-central1.run.app/](url)
 | Backend            | FastAPI (Python 3.10+)                              | Lightweight, async-ready |
 | AI Query Parser    | Google Vertex AI → `gemini-1.5-pro-001` <br>Fallback: rule-based keyword parser | Works even if Vertex AI keys missing |
 | Data Layer         | In-memory Pandas DataFrames (cached)                | Fake data generated on first call |
-| Frontend           | Pure HTML + CSS + vanilla JS (no React/Vue)        | Single-page, Claude-style minimal UI |
+| Frontend           | Pure HTML + CSS + vanilla JS (no React/Vue)        | Single-page, minimal UI |
 | Charts             | Plotly.js 2.27 (via CDN)                            | Responsive, good-looking |
 | Deployment ready   | Any platform that runs Python + uvicorn/gunicorn    | Docker-ready with minimal changes |
 | Hosting examples   | **GCP Cloud Run** (primary: https://dashboard-agent-799818976326.us-central1.run.app/) <br>Alternatives: Render, Fly.io, Railway, Vercel (with serverless adapter), AWS | Zero-ops possible; Cloud Run confirmed live with core UI (header, analytics feature list) rendering successfully |
