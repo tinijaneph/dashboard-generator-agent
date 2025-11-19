@@ -9,7 +9,7 @@
 | Frontend           | Pure HTML + CSS + vanilla JS (no React/Vue)        | Single-page, minimal UI |
 | Charts             | Plotly.js 2.27 (via CDN)                            | Responsive, good-looking |
 | Deployment ready   | Any platform that runs Python + uvicorn/gunicorn    | Docker-ready with minimal changes |
-| Hosting examples   | **GCP Cloud Run** (primary: https://dashboard-agent-799818976326.us-central1.run.app/) <br>Alternatives: Render, Fly.io, Railway, Vercel (with serverless adapter), AWS | Zero-ops possible; Cloud Run confirmed live with core UI (header, analytics feature list) rendering successfully |
+| Hosting examples   | **GCP Cloud Run** (primary: https://dashboard-agent-799818976326.us-central1.run.app/) <br> | Zero-ops possible; Cloud Run confirmed live with core UI (header, analytics feature list) rendering successfully |
 
 #### 2. Core Logic Flow
 ```
