@@ -1,0 +1,45 @@
+steps:
+  # Build the Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/molten-album-478703-d8/dashboard-agent/dashboard-agent:$COMMIT_SHA'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/molten-album-478703-d8/dashboard-agent/dashboard-agent:latest'
+      - '.'
+
+  # Push to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/molten-album-478703-d8/dashboard-agent/dashboard-agent:$COMMIT_SHA'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/molten-album-478703-d8/dashboard-agent/dashboard-agent:latest'
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'dashboard-agent'
+      - '--image=us-central1-docker.pkg.dev/molten-album-478703-d8/dashboard-agent/dashboard-agent:$COMMIT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--memory=2Gi'
+      - '--cpu=2'
+      - '--timeout=120'
+      - '--concurrency=80'
+      - '--set-env-vars=GCP_PROJECT_ID=molten-album-478703-d8,GCP_LOCATION=us-central1,GCS_BUCKET=dashboard-generator-data,GCS_FILE=nominative_list.csv'
+
+images:
+  - 'us-central1-docker.pkg.dev/molten-album-478703-d8/dashboard-agent/dashboard-agent:$COMMIT_SHA'
+  - 'us-central1-docker.pkg.dev/molten-album-478703-d8/dashboard-agent/dashboard-agent:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
