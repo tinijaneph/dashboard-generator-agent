@@ -6,18 +6,37 @@ An AI-powered dashboard generator that turns natural language prompts into execu
 
 ## Table of Contents
 
-1. [Project Structure](#1-project-structure)
-2. [How Data Is Processed](#2-how-data-is-processed)
-3. [How the Agent Picks Relevant Data](#3-how-the-agent-picks-relevant-data)
-4. [Handling Unknown Data — No Context Mode](#4-handling-unknown-data--no-context-mode)
-5. [Field Categories — Handling Different Values](#5-field-categories--handling-different-values)
-6. [Deployment](#6-deployment)
-7. [Environment Variables](#7-environment-variables)
-8. [What Improved vs the Previous Version](#8-what-improved-vs-the-previous-version)
+1. [Current Stack & Infrastructure](#1-current-stack--infrastructure)
+2. [Project Structure](#2-project-structure)
+3. [How Data Is Processed](#3-how-data-is-processed)
+4. [How the Agent Picks Relevant Data](#4-how-the-agent-picks-relevant-data)
+5. [Handling Unknown Data — No Context Mode](#5-handling-unknown-data--no-context-mode)
+6. [Field Categories — Handling Different Values](#6-field-categories--handling-different-values)
+7. [Deployment](#7-deployment)
+8. [Environment Variables](#8-environment-variables)
+9. [What Improved vs the Previous Version](#9-what-improved-vs-the-previous-version)
 
 ---
 
-## 1. Project Structure
+## 1. Current Stack & Infrastructure
+
+| Layer | Technology / Choice | Notes |
+|---|---|---|
+| **Backend** | Flask (Python 3.11) | Lightweight, synchronous, easy to deploy on Cloud Run |
+| **AI Model** | Google Vertex AI → `gemini-2.0-flash-001` | Called via `vertexai` Python SDK; handles prompt + JSON response |
+| **Data Layer** | In-memory Pandas DataFrame (cached on first request) | Loaded from GCS on startup; falls back to local CSV if GCS unavailable |
+| **Data Storage** | GCS bucket `dashboard-generator-data/nominative_list.csv` | Single CSV file; swap file name via `GCS_FILE` env var |
+| **Frontend** | React 18 + Vite | Component-based SPA; no CSS framework — all inline styles via theme tokens |
+| **Charts** | Recharts 2.x (via npm) | Responsive; supports bar, grouped_bar, stacked_bar, composed, line, donut, pie, table |
+| **Serving** | `serve_static.py` — Flask catch-all serves React `dist/` | Single container serves both API and frontend; no nginx needed |
+| **Build** | Two-stage Dockerfile (Node 20 Alpine → Python 3.11 slim) | Stage 1 builds React; Stage 2 runs Flask + copies `dist/` |
+| **CI/CD** | GCP Cloud Build (`cloudbuild.yaml`) | One command: build → push to Artifact Registry → deploy to Cloud Run |
+| **Hosting** | GCP Cloud Run (`us-central1`) | Zero-ops, scales to zero, auto-HTTPS; project `molten-album-478703-d8` |
+| **Live URL** | `https://dashboard-agent-mbhsrssbzq-uc.a.run.app` | Publicly accessible, no auth required (`--allow-unauthenticated`) |
+
+---
+
+## 2. Project Structure
 
 ```
 agent-dash/
@@ -43,7 +62,7 @@ The app is deployed as a **single container** on Cloud Run. The Dockerfile has t
 
 ---
 
-## 2. How Data Is Processed
+## 3. How Data Is Processed
 
 ### Loading
 
@@ -107,7 +126,7 @@ If the DataFrame is unavailable (GCS unreachable and no local file), the fronten
 
 ---
 
-## 3. How the Agent Picks Relevant Data
+## 4. How the Agent Picks Relevant Data
 
 The agent does not hard-code which fields to use. Instead, relevance selection happens in two places:
 
@@ -154,7 +173,7 @@ if "Is_Latest_Snapshot" in df.columns:
 
 ---
 
-## 4. Handling Unknown Data — No Context Mode
+## 5. Handling Unknown Data — No Context Mode
 
 If the CSV cannot be loaded (network issue, wrong bucket name, file not found), the system degrades gracefully rather than failing.
 
@@ -191,7 +210,7 @@ This means a user can demo the product or test the UI before the data file is av
 
 ---
 
-## 5. Field Categories — Handling Different Values
+## 6. Field Categories — Handling Different Values
 
 The field values in the data (e.g. what `Active_Workforce_Status` actually contains) are not hardcoded in the agent. They are discovered dynamically from the data each time via `get_data_summary()`. This means:
 
@@ -255,7 +274,7 @@ If you want to point the agent at a completely different CSV:
 
 ---
 
-## 6. Deployment
+## 7. Deployment
 
 ### Prerequisites (one-time)
 
@@ -308,11 +327,11 @@ cd frontend && npm install && npm run dev
 
 ---
 
-## 7. Environment Variables
+## 8. Environment Variables
 
 ---
 
-## 8. What Improved vs the Previous Version
+## 9. What Improved vs the Previous Version
 
 This section documents what changed from the original `main.py` and `DashboardAgent.jsx` files.
 
