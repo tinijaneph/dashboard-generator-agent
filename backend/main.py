@@ -51,53 +51,166 @@ def load_dataset():
         return None
 
 
+def get_latest_snapshot(df):
+    """
+    Returns a DataFrame scoped to the single latest snapshot only.
+    This is critical because the CSV is a longitudinal record — each employee
+    can appear many times (one row per snapshot month). We never want to count
+    raw rows; we always want distinct employees at the most recent point in time.
+
+    Priority:
+    1. Is_Latest_Snapshot == True  (explicit flag in data)
+    2. Most recent Snapshot_Month_Series timestamp
+    3. Most recent Snapshot_Year + Snapshot_Month combination
+    4. Full DataFrame as last resort (with a warning)
+    """
+    # Option 1: explicit flag
+    if "Is_Latest_Snapshot" in df.columns:
+        latest = df[df["Is_Latest_Snapshot"].astype(str).str.lower().isin(["true", "1", "yes"])]
+        if len(latest) > 0:
+            return latest, "Is_Latest_Snapshot flag"
+
+    # Option 2: timestamp column
+    if "Snapshot_Month_Series" in df.columns:
+        try:
+            df["_ts"] = pd.to_datetime(df["Snapshot_Month_Series"], errors="coerce")
+            max_ts = df["_ts"].max()
+            latest = df[df["_ts"] == max_ts].drop(columns=["_ts"])
+            if len(latest) > 0:
+                return latest, f"Snapshot_Month_Series={max_ts}"
+        except Exception:
+            pass
+
+    # Option 3: year + month combo
+    if "Snapshot_Year" in df.columns and "Snapshot_Month" in df.columns:
+        try:
+            df["_ym"] = df["Snapshot_Year"].astype(str) + "-" + df["Snapshot_Month"].astype(str).str.zfill(2)
+            max_ym = df["_ym"].max()
+            latest = df[df["_ym"] == max_ym].drop(columns=["_ym"])
+            if len(latest) > 0:
+                return latest, f"Snapshot {max_ym}"
+        except Exception:
+            pass
+
+    # Fallback
+    print("WARNING: Could not isolate latest snapshot — using full dataset")
+    return df, "full dataset (no snapshot column found)"
+
+
 def get_data_summary():
-    df = load_dataset()
-    if df is None:
+    """
+    Build a data-adaptive summary injected into every prompt.
+    Always operates on the LATEST SNAPSHOT only — never on raw row counts.
+    This means the summary is accurate regardless of dataset size (50k or 5M rows).
+    """
+    df_raw = load_dataset()
+    if df_raw is None:
         return "Dataset not available. Using schema-only mode."
 
-    total = len(df)
+    # Always scope to latest snapshot
+    df, snapshot_label = get_latest_snapshot(df_raw)
+    total_raw = len(df_raw)
+    total_snapshot = len(df)
     cols = list(df.columns)
 
-    summary_parts = [f"DATASET: {total:,} employee records", f"COLUMNS ({len(cols)}): {', '.join(cols[:30])}"]
+    # Distinct employee count (using corporate ID if available)
+    id_col = next((c for c in ["Corporate_ID", "Nominative_List_Unique_ID"] if c in df.columns), None)
+    distinct_employees = df[id_col].nunique() if id_col else total_snapshot
 
-    # Snapshot/time dimension
-    if "Snapshot_Year" in df.columns:
-        years = sorted(df["Snapshot_Year"].dropna().unique().tolist())
-        summary_parts.append(f"YEARS IN DATA: {years}")
-    if "Snapshot_Month" in df.columns:
-        months = sorted(df["Snapshot_Month"].dropna().unique().tolist())
-        summary_parts.append(f"MONTHS: {months[:12]}")
+    parts = [
+        f"SNAPSHOT: {snapshot_label}",
+        f"DISTINCT EMPLOYEES (latest snapshot): {distinct_employees:,}",
+        f"TOTAL ROWS IN FULL DATASET: {total_raw:,} (longitudinal — multiple rows per employee over time)",
+        f"SNAPSHOT ROWS: {total_snapshot:,}",
+        f"COLUMNS ({len(cols)}): {', '.join(cols[:35])}",
+    ]
 
-    # Workforce status / attrition proxy
+    # Time coverage
+    if "Snapshot_Year" in df_raw.columns:
+        years = sorted(df_raw["Snapshot_Year"].dropna().unique().tolist())
+        parts.append(f"YEARS COVERED IN FULL DATA: {years}")
+    if "Snapshot_Month_Series" in df_raw.columns:
+        try:
+            ts = pd.to_datetime(df_raw["Snapshot_Month_Series"], errors="coerce")
+            parts.append(f"DATE RANGE: {ts.min().strftime('%Y-%m')} to {ts.max().strftime('%Y-%m')}")
+        except Exception:
+            pass
+
+    def dist(col, n=8):
+        """Return value_counts as dict for a column, from latest snapshot."""
+        if col not in df.columns:
+            return None
+        counts = df[col].dropna().value_counts().head(n).to_dict()
+        return {str(k): int(v) for k, v in counts.items()}
+
+    def pct(col, val):
+        """Return percentage of rows where col == val."""
+        if col not in df.columns:
+            return None
+        return round(len(df[df[col].astype(str) == str(val)]) / len(df) * 100, 1)
+
+    # Workforce status — most important field
     for col in ["Active_Workforce_Status", "Current_Staffing_Status"]:
-        if col in df.columns:
-            dist = df[col].value_counts().head(5).to_dict()
-            summary_parts.append(f"{col}: {json.dumps(dist)}")
+        d = dist(col)
+        if d:
+            parts.append(f"{col} (distinct employee counts at latest snapshot): {json.dumps(d)}")
 
     # Demographics
-    for col in ["Gender", "Age_Group", "Band", "Blue_White_Collar", "Worker_Category", "Contract_Type"]:
-        if col in df.columns:
-            dist = df[col].value_counts().head(6).to_dict()
-            summary_parts.append(f"{col}: {json.dumps(dist)}")
+    for col in ["Gender", "Age_Group", "Band", "Band_Level", "Blue_White_Collar",
+                "Worker_Category", "Contract_Type", "Professional_Category"]:
+        d = dist(col)
+        if d:
+            parts.append(f"{col}: {json.dumps(d)}")
 
-    # Org
-    for col in ["Function", "Job_Family_Group", "Job_Family", "Job_Category", "Professional_Category"]:
-        if col in df.columns:
-            dist = df[col].value_counts().head(6).to_dict()
-            summary_parts.append(f"{col}: {json.dumps(dist)}")
+    # Org structure
+    for col in ["Function", "Job_Family_Group", "Job_Family", "Job_Category",
+                "Direct_Indirect", "Position_Worker_Type"]:
+        d = dist(col)
+        if d:
+            parts.append(f"{col}: {json.dumps(d)}")
 
-    # Location
-    for col in ["Reporting_Region", "Company_Country", "City_Name"]:
-        if col in df.columns:
-            dist = df[col].value_counts().head(6).to_dict()
-            summary_parts.append(f"{col}: {json.dumps(dist)}")
+    # Geography
+    for col in ["Reporting_Region", "Company_Country", "City_Name", "Company_Name"]:
+        d = dist(col)
+        if d:
+            parts.append(f"{col}: {json.dumps(d)}")
 
-    # FTE
+    # FTE — numeric, use mean/total on latest snapshot
     if "FTE" in df.columns:
-        summary_parts.append(f"FTE: avg={df['FTE'].mean():.2f}, total={df['FTE'].sum():,.1f}")
+        try:
+            fte = pd.to_numeric(df["FTE"], errors="coerce").dropna()
+            parts.append(f"FTE: avg={fte.mean():.2f}, total={fte.sum():,.1f}, min={fte.min():.2f}, max={fte.max():.2f}")
+        except Exception:
+            pass
 
-    return "\n".join(summary_parts)
+    # Seniority / tenure if available
+    for col in ["Original_Hire_Date", "Seniority_Date", "Continuous_Service_Date"]:
+        if col in df.columns:
+            try:
+                dates = pd.to_datetime(df[col], errors="coerce").dropna()
+                if len(dates) > 0:
+                    import datetime as dt_mod
+                    now = pd.Timestamp.now()
+                    tenure_years = ((now - dates).dt.days / 365.25).dropna()
+                    parts.append(f"{col} → avg tenure: {tenure_years.mean():.1f} yrs, median: {tenure_years.median():.1f} yrs")
+            except Exception:
+                pass
+
+    # Supervisory org depth
+    for level in range(1, 5):
+        col = f"Supervisory_Organization_Level_{level}_Name"
+        d = dist(col, n=5)
+        if d:
+            parts.append(f"Supervisory Level {level} (top 5): {json.dumps(d)}")
+            break  # just show the top level found
+
+    parts.append(
+        "IMPORTANT FOR AI: All counts above are for DISTINCT EMPLOYEES at the latest snapshot. "
+        "Do NOT reference 555k or any raw row count — that is longitudinal history. "
+        "Use the distinct employee numbers when writing insights and KPI values."
+    )
+
+    return "\n".join(parts)
 
 
 SYSTEM_PROMPT = """You are an elite HR Analytics AI generating executive-grade dashboards matching Brick AI and Tableau quality.
@@ -321,63 +434,176 @@ Return the complete updated dashboard JSON with all sections.
 """
 
 
-def calculate_actual_data(viz_type, fields, data_hint=""):
-    """Compute real data from the dataset for chart rendering."""
-    df = load_dataset()
-    if df is None:
+def calculate_actual_data(viz_type, fields, data_hint="", active_filters=None):
+    """
+    Compute real chart data from the dataset.
+
+    Always scopes to the LATEST SNAPSHOT for point-in-time accuracy.
+    For line/trend charts, uses the FULL longitudinal dataset grouped by snapshot.
+
+    active_filters: dict of {field_name: [selected_values]} — applied before aggregation.
+    This is how the UI filter bar actually changes chart data.
+    """
+    df_raw = load_dataset()
+    if df_raw is None:
         return []
 
     try:
-        hint = data_hint.lower() if data_hint else ""
+        hint = (data_hint or "").lower()
         primary_field = fields[0] if fields else None
+        secondary_field = fields[1] if len(fields) > 1 else None
 
-        # Use only the latest snapshot if available
-        if "Is_Latest_Snapshot" in df.columns:
-            latest = df[df["Is_Latest_Snapshot"] == True]
-            if len(latest) > 0:
-                df = latest
+        # Line/trend charts need the full longitudinal data grouped by snapshot
+        is_time_series = viz_type == "line" or "trend" in hint or "time" in hint or "month" in hint
 
+        if is_time_series:
+            df = df_raw.copy()
+        else:
+            # All other charts: scope to latest snapshot only
+            df, _ = get_latest_snapshot(df_raw)
+
+        # Apply active UI filters (this is what makes filter chips actually work)
+        if active_filters:
+            for filter_field, selected_values in active_filters.items():
+                if filter_field in df.columns and selected_values:
+                    df = df[df[filter_field].astype(str).isin([str(v) for v in selected_values])]
+
+        if len(df) == 0:
+            return []
+
+        # ── TABLE ─────────────────────────────────────────────────────────────
         if viz_type == "table":
-            if len(fields) >= 2 and fields[0] in df.columns:
-                rows = []
-                group_col = fields[0]
-                metric_cols = [f for f in fields[1:] if f in df.columns]
-                if metric_cols:
-                    grp = df.groupby(group_col).agg(
-                        {c: "count" for c in metric_cols[:1]}
-                    ).reset_index()
-                    grp.columns = [group_col] + [f"Count_{c}" for c in metric_cols[:1]]
-                    for _, row in grp.head(10).iterrows():
-                        rows.append(row.to_dict())
-                    return rows
-            # Fallback: counts for primary field
-            if primary_field and primary_field in df.columns:
-                counts = df[primary_field].value_counts().head(10).reset_index()
-                counts.columns = [primary_field, "Count"]
+            valid_fields = [f for f in fields if f in df.columns]
+            if not valid_fields:
+                return []
+            group_col = valid_fields[0]
+
+            # Try to build a rich table: headcount + breakdown by second field if available
+            if secondary_field and secondary_field in df.columns:
+                grp = df.groupby([group_col, secondary_field]).size().reset_index(name="Count")
+                # Pivot so each value of secondary becomes a column
+                pivoted = grp.pivot_table(index=group_col, columns=secondary_field, values="Count", fill_value=0)
+                pivoted["Total"] = pivoted.sum(axis=1)
+                pivoted = pivoted.sort_values("Total", ascending=False).head(10)
+                pivoted = pivoted.reset_index()
+                # Round and convert
+                result = []
+                for _, row in pivoted.iterrows():
+                    result.append({str(k): (int(v) if isinstance(v, (int, float)) else str(v)) for k, v in row.items()})
+                return result
+            else:
+                # Simple count table
+                counts = df[group_col].value_counts().head(10).reset_index()
+                counts.columns = [group_col, "Count"]
+                # Add percentage column
+                counts["Rate %"] = (counts["Count"] / counts["Count"].sum() * 100).round(1).astype(str) + "%"
                 return counts.to_dict("records")
 
-        elif viz_type in ("bar", "stacked_bar", "grouped_bar"):
+        # ── GROUPED / STACKED BAR — requires two fields ───────────────────────
+        elif viz_type in ("grouped_bar", "stacked_bar"):
+            if primary_field and secondary_field and primary_field in df.columns and secondary_field in df.columns:
+                grp = df.groupby([primary_field, secondary_field]).size().reset_index(name="count")
+                pivoted = grp.pivot_table(index=primary_field, columns=secondary_field, values="count", fill_value=0)
+                # Sort by total descending, keep top 8 categories
+                pivoted["_total"] = pivoted.sum(axis=1)
+                pivoted = pivoted.sort_values("_total", ascending=False).head(8).drop(columns=["_total"])
+                result = []
+                for idx, row in pivoted.iterrows():
+                    entry = {"name": str(idx)}
+                    for col in pivoted.columns:
+                        entry[str(col)] = int(row[col])
+                    result.append(entry)
+                return result
+            elif primary_field and primary_field in df.columns:
+                counts = df[primary_field].value_counts().head(8)
+                return [{"name": str(k), "value": int(v)} for k, v in counts.items()]
+
+        # ── SIMPLE BAR ────────────────────────────────────────────────────────
+        elif viz_type == "bar":
             if primary_field and primary_field in df.columns:
                 counts = df[primary_field].value_counts().head(10)
                 return [{"name": str(k), "value": int(v)} for k, v in counts.items()]
 
+        # ── HORIZONTAL BAR ───────────────────────────────────────────────────
+        elif viz_type == "horizontal_bar":
+            if primary_field and secondary_field and primary_field in df.columns and secondary_field in df.columns:
+                grp = df.groupby([primary_field, secondary_field]).size().reset_index(name="count")
+                pivoted = grp.pivot_table(index=primary_field, columns=secondary_field, values="count", fill_value=0)
+                pivoted["_total"] = pivoted.sum(axis=1)
+                pivoted = pivoted.sort_values("_total", ascending=False).head(10).drop(columns=["_total"])
+                result = []
+                for idx, row in pivoted.iterrows():
+                    entry = {"name": str(idx)}
+                    for col in pivoted.columns:
+                        entry[str(col)] = int(row[col])
+                    result.append(entry)
+                return result
+            elif primary_field and primary_field in df.columns:
+                counts = df[primary_field].value_counts().head(10)
+                return [{"name": str(k), "value": int(v)} for k, v in counts.items()]
+
+        # ── LINE / TIME SERIES — uses full longitudinal data ─────────────────
         elif viz_type == "line":
-            # Time series
             if "Snapshot_Month_Series" in df.columns:
-                ts = df.groupby("Snapshot_Month_Series").size().reset_index(name="value")
-                ts = ts.sort_values("Snapshot_Month_Series")
-                return [{"name": str(r["Snapshot_Month_Series"]), "value": int(r["value"])} for _, r in ts.iterrows()]
+                try:
+                    df["_ts"] = pd.to_datetime(df["Snapshot_Month_Series"], errors="coerce")
+                    grp = df.dropna(subset=["_ts"]).groupby("_ts")
+                    if secondary_field and secondary_field in df.columns:
+                        # Multi-series: one line per value of secondary_field
+                        pivoted = df.dropna(subset=["_ts"]).groupby(["_ts", secondary_field]).size().reset_index(name="count")
+                        top_vals = df[secondary_field].value_counts().head(4).index.tolist()
+                        pivoted = pivoted[pivoted[secondary_field].isin(top_vals)]
+                        piv = pivoted.pivot_table(index="_ts", columns=secondary_field, values="count", fill_value=0).reset_index()
+                        piv = piv.sort_values("_ts")
+                        result = []
+                        for _, row in piv.iterrows():
+                            entry = {"name": str(row["_ts"])[:7]}
+                            for col in piv.columns:
+                                if col != "_ts":
+                                    entry[str(col)] = int(row[col])
+                            result.append(entry)
+                        return result
+                    else:
+                        ts = grp.size().reset_index(name="value").sort_values("_ts")
+                        return [{"name": str(r["_ts"])[:7], "value": int(r["value"])} for _, r in ts.iterrows()]
+                except Exception as e:
+                    print(f"Time series error: {e}")
             elif "Snapshot_Year" in df.columns:
                 ts = df.groupby("Snapshot_Year").size().reset_index(name="value")
                 return [{"name": str(r["Snapshot_Year"]), "value": int(r["value"])} for _, r in ts.iterrows()]
 
+        # ── COMPOSED — bar + line (e.g. count bar + rate line) ───────────────
+        elif viz_type == "composed":
+            if primary_field and primary_field in df.columns:
+                counts = df[primary_field].value_counts().head(8)
+                result = []
+                for k, v in counts.items():
+                    subset = df[df[primary_field] == k]
+                    entry = {"name": str(k), "Count": int(v)}
+                    # If there's a status field, compute a rate
+                    if "Active_Workforce_Status" in df.columns:
+                        inactive = len(subset[subset["Active_Workforce_Status"].astype(str).str.lower() != "active"])
+                        rate = round(inactive / v * 100, 1) if v > 0 else 0
+                        entry["Attrition Rate %"] = rate
+                    elif secondary_field and secondary_field in df.columns:
+                        try:
+                            val = pd.to_numeric(subset[secondary_field], errors="coerce").mean()
+                            entry[secondary_field] = round(float(val), 2) if not pd.isna(val) else 0
+                        except Exception:
+                            pass
+                    result.append(entry)
+                return result
+
+        # ── PIE / DONUT ───────────────────────────────────────────────────────
         elif viz_type in ("pie", "donut"):
             if primary_field and primary_field in df.columns:
                 counts = df[primary_field].value_counts().head(6)
                 return [{"name": str(k), "value": int(v)} for k, v in counts.items()]
 
     except Exception as e:
+        import traceback
         print(f"Data calculation error: {e}")
+        traceback.print_exc()
 
     return []
 
@@ -402,6 +628,8 @@ def chat():
         conversation_history = data.get("history", [])
         current_dashboard = data.get("current_dashboard", None)
 
+        active_filters = data.get("active_filters", {})  # {field: [selected_values]}
+
         data_summary = get_data_summary()
         context = SYSTEM_PROMPT.format(data_summary=data_summary) + "\n\n"
 
@@ -411,6 +639,10 @@ def chat():
 
 Instructions: The user wants to MODIFY this dashboard. Add/change only what they request.
 Keep all existing visualizations. Return the complete updated dashboard JSON.\n\n"""
+
+        if active_filters:
+            filter_desc = ", ".join([f"{k}={v}" for k, v in active_filters.items()])
+            context += f"ACTIVE FILTERS (data is pre-filtered to these values): {filter_desc}\n\n"
 
         for msg in conversation_history[-6:]:  # last 3 turns
             role = "User" if msg["role"] == "user" else "Assistant"
@@ -428,7 +660,6 @@ Keep all existing visualizations. Return the complete updated dashboard JSON.\n\
         )
 
         raw = response.text.strip()
-        # Strip markdown fences
         for fence in ["```json", "```"]:
             if fence in raw:
                 start = raw.find(fence) + len(fence)
@@ -446,13 +677,13 @@ Keep all existing visualizations. Return the complete updated dashboard JSON.\n\
                 "suggestions": ["Try again", "Add a chart", "Explore themes"],
             }
 
-        # Enrich visualizations with actual computed data
+        # Enrich visualizations with actual computed data (respecting active filters)
         dashboard = parsed.get("dashboard")
         if dashboard and "visualizations" in dashboard:
             for viz in dashboard["visualizations"]:
                 fields = viz.get("fields", [])
                 hint = viz.get("data_hint", "")
-                computed = calculate_actual_data(viz["type"], fields, hint)
+                computed = calculate_actual_data(viz["type"], fields, hint, active_filters)
                 if computed:
                     viz["computed_data"] = computed
 
@@ -472,25 +703,171 @@ Keep all existing visualizations. Return the complete updated dashboard JSON.\n\
 
 @app.route("/api/chart-data", methods=["POST"])
 def get_chart_data():
-    """Compute real chart data for a given visualization config."""
+    """
+    Compute real chart data for a given visualization config.
+    Accepts active_filters to recompute filtered chart data when user changes filter selections.
+    """
     try:
         data = request.json
         viz_type = data.get("type", "bar")
         fields = data.get("fields", [])
         hint = data.get("data_hint", "")
-        computed = calculate_actual_data(viz_type, fields, hint)
+        active_filters = data.get("active_filters", {})
+        computed = calculate_actual_data(viz_type, fields, hint, active_filters)
         return jsonify({"data": computed})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/deeper-insights", methods=["POST"])
+def deeper_insights():
+    """
+    Generate richer analyst-quality insights for a specific visualization.
+    This is called when user clicks "Generate deeper insights" — it returns
+    enhanced key_insights for each chart based on the actual computed data.
+    """
+    try:
+        req = request.json
+        dashboard = req.get("dashboard", {})
+        active_filters = req.get("active_filters", {})
+
+        if not dashboard:
+            return jsonify({"error": "No dashboard provided"}), 400
+
+        # Build a data-rich context for each visualization
+        viz_data_context = []
+        for viz in dashboard.get("visualizations", []):
+            fields = viz.get("fields", [])
+            hint = viz.get("data_hint", "")
+            computed = calculate_actual_data(viz["type"], fields, hint, active_filters)
+            if computed:
+                viz_data_context.append({
+                    "id": viz.get("id", ""),
+                    "title": viz.get("title", ""),
+                    "type": viz.get("type", ""),
+                    "actual_data": computed[:10]  # first 10 rows/entries
+                })
+
+        filter_desc = f"Active filters: {active_filters}" if active_filters else "No active filters — full dataset"
+        data_summary = get_data_summary()
+
+        prompt = f"""You are an expert HR data analyst. Based on the actual computed data below, 
+generate sharper, more specific key insights for each visualization.
+
+DATASET CONTEXT:
+{data_summary}
+
+{filter_desc}
+
+VISUALIZATIONS WITH ACTUAL DATA:
+{json.dumps(viz_data_context, indent=2)}
+
+CURRENT DASHBOARD TITLE: {dashboard.get("title", "")}
+
+For each visualization, return 2-3 insights that:
+1. Quote specific numbers directly from the actual_data provided
+2. Make an interpretation (not just describe — explain what it means for the business)
+3. Are concise — under 20 words each
+
+Respond ONLY with valid JSON, no markdown:
+{{
+  "enhanced_insights": {{
+    "<viz_id>": ["insight 1 with real number", "interpretation of why it matters", "optional third insight"],
+    ...
+  }},
+  "overall_insights": [
+    "5 updated overall insights based on actual data with real numbers"
+  ]
+}}"""
+
+        response = model.generate_content(
+            prompt,
+            generation_config={"max_output_tokens": 4096, "temperature": 0.2, "top_p": 0.9},
+        )
+
+        raw = response.text.strip()
+        for fence in ["```json", "```"]:
+            if fence in raw:
+                start = raw.find(fence) + len(fence)
+                end = raw.rfind("```")
+                raw = raw[start:end].strip()
+                break
+
+        parsed = json.loads(raw)
+
+        # Merge enhanced insights back into the dashboard visualizations
+        enhanced = parsed.get("enhanced_insights", {})
+        updated_vizs = []
+        for viz in dashboard.get("visualizations", []):
+            viz_id = viz.get("id", "")
+            if viz_id in enhanced:
+                viz = {**viz, "key_insights": enhanced[viz_id]}
+            updated_vizs.append(viz)
+
+        updated_dashboard = {
+            **dashboard,
+            "visualizations": updated_vizs,
+            "overall_insights": parsed.get("overall_insights", dashboard.get("overall_insights", [])),
+        }
+
+        return jsonify({
+            "dashboard": updated_dashboard,
+            "message": "Insights refreshed with actual data.",
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/schema", methods=["GET"])
 def get_schema():
-    df = load_dataset()
-    if df is None:
-        return jsonify({"columns": [], "sample": {}})
-    sample = {col: df[col].dropna().unique()[:3].tolist() for col in df.columns[:20]}
-    return jsonify({"columns": list(df.columns), "row_count": len(df), "sample": sample})
+    """
+    Returns columns, row counts, and real distinct values for key categorical fields.
+    Used by the frontend to populate filter dropdowns with actual data values.
+    Always scoped to the latest snapshot so filter options match what users see.
+    """
+    df_raw = load_dataset()
+    if df_raw is None:
+        return jsonify({"columns": [], "sample": {}, "distinct_values": {}})
+
+    df, snapshot_label = get_latest_snapshot(df_raw)
+
+    # Key fields for filtering — return all distinct values (up to 50 per field)
+    filter_fields = [
+        "Active_Workforce_Status", "Current_Staffing_Status",
+        "Gender", "Age_Group", "Band", "Band_Level",
+        "Blue_White_Collar", "Worker_Category", "Contract_Type",
+        "Professional_Category", "Function", "Job_Family_Group",
+        "Job_Family", "Job_Category", "Direct_Indirect",
+        "Reporting_Region", "Company_Country", "Company_Name",
+        "Snapshot_Year", "Position_Worker_Type",
+    ]
+
+    distinct_values = {}
+    for col in filter_fields:
+        if col in df.columns:
+            vals = df[col].dropna().unique().tolist()
+            distinct_values[col] = sorted([str(v) for v in vals])[:50]
+
+    # Small sample for all columns (for schema browsing)
+    sample = {}
+    for col in df.columns[:30]:
+        sample[col] = [str(v) for v in df[col].dropna().unique()[:3].tolist()]
+
+    id_col = next((c for c in ["Corporate_ID", "Nominative_List_Unique_ID"] if c in df.columns), None)
+    distinct_employees = int(df[id_col].nunique()) if id_col else len(df)
+
+    return jsonify({
+        "columns": list(df.columns),
+        "total_rows": len(df_raw),
+        "snapshot_rows": len(df),
+        "distinct_employees": distinct_employees,
+        "snapshot_label": snapshot_label,
+        "sample": sample,
+        "distinct_values": distinct_values,
+    })
 
 
 if __name__ == "__main__":
