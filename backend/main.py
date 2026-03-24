@@ -97,341 +97,207 @@ def get_latest_snapshot(df):
     return df, "full dataset (no snapshot column found)"
 
 
+def compute_descriptive_stats(df):
+    """
+    Compute real descriptive statistics from any DataFrame.
+    Returns a dict of {field: {value: count}} for every categorical column,
+    plus numeric summaries for numeric columns.
+    This is completely data-driven — no field names or values are assumed.
+    """
+    stats = {}
+    for col in df.columns:
+        non_null = df[col].dropna()
+        if len(non_null) == 0:
+            continue
+        # Detect numeric
+        numeric = pd.to_numeric(non_null, errors='coerce').dropna()
+        if len(numeric) / max(len(non_null), 1) > 0.8:
+            # Numeric column
+            stats[col] = {
+                "type": "numeric",
+                "count": int(len(numeric)),
+                "mean": round(float(numeric.mean()), 2),
+                "median": round(float(numeric.median()), 2),
+                "min": round(float(numeric.min()), 2),
+                "max": round(float(numeric.max()), 2),
+            }
+        else:
+            # Categorical column
+            vc = non_null.astype(str).value_counts()
+            n_unique = len(vc)
+            # Only include if cardinality is useful (2-200 unique values)
+            if 2 <= n_unique <= 200:
+                stats[col] = {
+                    "type": "categorical",
+                    "n_unique": n_unique,
+                    "top_values": {str(k): int(v) for k, v in vc.head(15).items()},
+                }
+    return stats
+
+
 def get_data_summary():
     """
-    Build a data-adaptive summary injected into every prompt.
-    Always operates on the LATEST SNAPSHOT only — never on raw row counts.
-    This means the summary is accurate regardless of dataset size (50k or 5M rows).
+    Builds a 100% data-driven summary from whatever CSV is loaded.
+    No field names, values, or counts are hardcoded anywhere.
+    The summary reflects the actual data at the latest snapshot point-in-time.
+    If the data changes (new fields, different categories, more/fewer employees),
+    this function automatically reflects those changes without any code modification.
     """
     df_raw = load_dataset()
     if df_raw is None:
-        return "Dataset not available. Using schema-only mode."
+        return "Dataset not available."
 
-    # Always scope to latest snapshot
     df, snapshot_label = get_latest_snapshot(df_raw)
-    total_raw = len(df_raw)
-    total_snapshot = len(df)
-    cols = list(df.columns)
 
-    # Distinct employee count (using corporate ID if available)
-    id_col = next((c for c in ["Corporate_ID", "Nominative_List_Unique_ID"] if c in df.columns), None)
-    distinct_employees = df[id_col].nunique() if id_col else total_snapshot
+    # Distinct employee count — try common ID columns, fall back to row count
+    id_col = next((c for c in ["Corporate_ID", "Nominative_List_Unique_ID", "Employee_ID", "EmpID"]
+                   if c in df.columns), None)
+    distinct_employees = int(df[id_col].nunique()) if id_col else len(df)
 
-    parts = [
-        f"SNAPSHOT: {snapshot_label}",
-        f"DISTINCT EMPLOYEES (latest snapshot): {distinct_employees:,}",
-        f"TOTAL ROWS IN FULL DATASET: {total_raw:,} (longitudinal — multiple rows per employee over time)",
-        f"SNAPSHOT ROWS: {total_snapshot:,}",
-        f"COLUMNS ({len(cols)}): {', '.join(cols[:35])}",
-    ]
-
-    # Time coverage
-    if "Snapshot_Year" in df_raw.columns:
-        years = sorted(df_raw["Snapshot_Year"].dropna().unique().tolist())
-        parts.append(f"YEARS COVERED IN FULL DATA: {years}")
+    # Date range from full longitudinal data
+    date_range = ""
     if "Snapshot_Month_Series" in df_raw.columns:
         try:
             ts = pd.to_datetime(df_raw["Snapshot_Month_Series"], errors="coerce")
-            parts.append(f"DATE RANGE: {ts.min().strftime('%Y-%m')} to {ts.max().strftime('%Y-%m')}")
+            date_range = f"{ts.min().strftime('%Y-%m')} to {ts.max().strftime('%Y-%m')}"
         except Exception:
             pass
 
-    def dist(col, n=8):
-        """Return value_counts as dict for a column, from latest snapshot."""
-        if col not in df.columns:
-            return None
-        counts = df[col].dropna().value_counts().head(n).to_dict()
-        return {str(k): int(v) for k, v in counts.items()}
+    # Build header
+    lines = [
+        f"=== DATASET STATISTICS (computed from actual data) ===",
+        f"Snapshot: {snapshot_label}",
+        f"Distinct employees (latest snapshot): {distinct_employees:,}",
+        f"Total longitudinal rows: {len(df_raw):,}",
+        f"Columns available ({len(df.columns)}): {', '.join(df.columns.tolist())}",
+    ]
+    if date_range:
+        lines.append(f"Date range covered: {date_range}")
 
-    def pct(col, val):
-        """Return percentage of rows where col == val."""
-        if col not in df.columns:
-            return None
-        return round(len(df[df[col].astype(str) == str(val)]) / len(df) * 100, 1)
+    # Compute descriptive stats on latest snapshot
+    stats = compute_descriptive_stats(df)
 
-    # Workforce status — most important field
-    for col in ["Active_Workforce_Status", "Current_Staffing_Status"]:
-        d = dist(col)
-        if d:
-            parts.append(f"{col} (distinct employee counts at latest snapshot): {json.dumps(d)}")
+    lines.append("")
+    lines.append("=== FIELD STATISTICS (actual values from latest snapshot) ===")
 
-    # Demographics
-    for col in ["Gender", "Age_Group", "Band", "Band_Level", "Blue_White_Collar",
-                "Worker_Category", "Contract_Type", "Professional_Category"]:
-        d = dist(col)
-        if d:
-            parts.append(f"{col}: {json.dumps(d)}")
+    for col, s in stats.items():
+        if s["type"] == "categorical":
+            # Format: FIELD_NAME (N unique): {"Val1": count, "Val2": count, ...}
+            lines.append(f'{col} ({s["n_unique"]} unique): {json.dumps(s["top_values"])}')
+        elif s["type"] == "numeric":
+            lines.append(
+                f'{col} [numeric]: mean={s["mean"]}, median={s["median"]}, '
+                f'min={s["min"]}, max={s["max"]}, n={s["count"]:,}'
+            )
 
-    # Org structure
-    for col in ["Function", "Job_Family_Group", "Job_Family", "Job_Category",
-                "Direct_Indirect", "Position_Worker_Type"]:
-        d = dist(col)
-        if d:
-            parts.append(f"{col}: {json.dumps(d)}")
-
-    # Geography
-    for col in ["Reporting_Region", "Company_Country", "City_Name", "Company_Name"]:
-        d = dist(col)
-        if d:
-            parts.append(f"{col}: {json.dumps(d)}")
-
-    # FTE — numeric, use mean/total on latest snapshot
-    if "FTE" in df.columns:
-        try:
-            fte = pd.to_numeric(df["FTE"], errors="coerce").dropna()
-            parts.append(f"FTE: avg={fte.mean():.2f}, total={fte.sum():,.1f}, min={fte.min():.2f}, max={fte.max():.2f}")
-        except Exception:
-            pass
-
-    # Seniority / tenure if available
-    for col in ["Original_Hire_Date", "Seniority_Date", "Continuous_Service_Date"]:
-        if col in df.columns:
-            try:
-                dates = pd.to_datetime(df[col], errors="coerce").dropna()
-                if len(dates) > 0:
-                    import datetime as dt_mod
-                    now = pd.Timestamp.now()
-                    tenure_years = ((now - dates).dt.days / 365.25).dropna()
-                    parts.append(f"{col} → avg tenure: {tenure_years.mean():.1f} yrs, median: {tenure_years.median():.1f} yrs")
-            except Exception:
-                pass
-
-    # Supervisory org depth
-    for level in range(1, 5):
-        col = f"Supervisory_Organization_Level_{level}_Name"
-        d = dist(col, n=5)
-        if d:
-            parts.append(f"Supervisory Level {level} (top 5): {json.dumps(d)}")
-            break  # just show the top level found
-
-    parts.append(
-        "IMPORTANT FOR AI: All counts above are for DISTINCT EMPLOYEES at the latest snapshot. "
-        "Do NOT reference 555k or any raw row count — that is longitudinal history. "
-        "Use the distinct employee numbers when writing insights and KPI values."
+    lines.append("")
+    lines.append(
+        "=== INSTRUCTION TO AI ===\n"
+        "The statistics above are the ONLY source of truth. "
+        "Use ONLY the field names listed in 'Columns available'. "
+        "Use ONLY the values shown in the field statistics above — never invent category names. "
+        "Use the exact counts shown for KPI values and insights. "
+        "Distinct employees = total headcount at latest snapshot."
     )
 
-    return "\n".join(parts)
+    return "\n".join(lines)
 
 
-SYSTEM_PROMPT = """You are an elite HR Analytics AI generating executive-grade dashboards matching Brick AI and Tableau quality.
 
-DATASET CONTEXT:
+SYSTEM_PROMPT = """You are an expert HR Analytics AI that generates data-driven dashboards.
+
+You receive computed statistics from the actual dataset. Your job is to:
+1. Read the field statistics and understand what the data contains
+2. Select the most relevant fields for the user's request
+3. Generate a dashboard JSON that reflects the REAL data — using only field names and values that exist in the statistics
+
+=== DATA CONTEXT ===
 {data_summary}
 
-AVAILABLE FIELDS:
-Gender, Age, Age_Group, Position_Title, Job_Profile, Job_Family, Job_Family_Group, Job_Category,
-Function, Band, Blue_White_Collar, Worker_Category, Professional_Category, Contract_Type, FTE,
-Active_Workforce_Status, Current_Staffing_Status, Company_Name, Entity_Name, Financial_Division_Name,
-Core_Division, City_Name, Company_Country, Reporting_Region, Snapshot_Month, Snapshot_Year,
-Snapshot_Month_Series, Is_Latest_Snapshot, Supervisory_Organization_Name, Supervisory_Organization_Level_1_Name
+=== CRITICAL RULES ===
+- NEVER use field names not listed in "Columns available"
+- NEVER invent category values — use ONLY values shown in the field statistics
+- NEVER use hardcoded numbers — derive all values from the statistics above
+- KPI values must come from the statistics (e.g. distinct employees = total headcount)
+- Chart fields must be real columns. Category names in insights must match actual values.
+- The data is longitudinal (one employee can have many rows over time). Always work from the latest snapshot counts.
 
-══════════════════════════════════════════
-STRICT QUALITY RULES — FOLLOW EXACTLY
-══════════════════════════════════════════
+=== OUTPUT FORMAT RULES ===
 
-OVERVIEW: Max 2 sentences. What it analyzes + why it matters. Never a list.
+OVERVIEW: 1-2 sentences. What the dashboard analyzes + why it matters. No lists.
 
-OVERALL_INSIGHTS: Exactly 5 bullets. Each MUST be under 20 words with a real number.
-  WRONG: "This dashboard provides a comprehensive view of workforce distribution across multiple dimensions"
-  RIGHT: "Operations and Sales account for 58% of all inactive employees in the dataset"
-  RIGHT: "Internship contracts show 3x higher attrition rate than permanent roles at 24% vs 8%"
+OVERALL_INSIGHTS: Exactly 5 bullets. Each must:
+  - Quote a real number derived from the statistics
+  - Be under 20 words
+  - State a finding + implication (not just a description)
 
-METRICS: 3-5 KPI cards. Keep insight field under 12 words.
+METRICS: 3-5 KPI cards derived from actual statistics.
 
-VISUALIZATIONS: Always generate exactly 7-8 charts. Use a variety of types.
-  For each visualization key_insights must be EXACTLY 2-3 bullets.
-  Each insight MUST include a real number AND be under 15 words.
-  Use these patterns:
-    "[Category]: [N] employees, [X]% rate — [superlative]"
-    "[Category A] has [X]x higher [metric] than [Category B] ([N]% vs [M]%)"
-    "[N] of [total] [group] are inactive — [X]% rate"
-  WRONG: "Operations has the highest number of inactive employees across all functions"
-  WRONG: "The chart reveals internship contracts show elevated departure rates"
-  WRONG: "Finance shows strong retention compared to other departments"
-  RIGHT: "Operations: 771 inactive, 28% rate — highest of all functions"
-  RIGHT: "Internship contracts: 24% attrition — 3x higher than permanent (8%)"
-  RIGHT: "Band I: 420 inactive of 1,350 total — 31% rate, most at-risk group"
+VISUALIZATIONS: 6-8 charts. For each:
+  - "fields" must only contain column names that exist in the data
+  - "key_insights": exactly 2-3 bullets, each under 15 words with a real number
+  - First bullet = specific number. Second bullet = what it implies for the business.
 
-  ANALYST INTERPRETATION RULE: The second or third bullet per chart should be an INTERPRETATION,
-  not just another number. It should explain WHY the finding matters or what it implies.
-  Example: "Internship contracts: 24% attrition — 3x higher than permanent (8%)"
-  Follow-up interpretation: "High intern churn suggests onboarding and conversion pipeline gaps"
-  Example: "Operations: 771 inactive — suggesting workload and management quality issues"
-  
-  The insight must read like a human analyst wrote it, not like a data label.
-  Brick AI style: "Sales revenue growth notably outpaces ad spend in Q4, suggesting improved efficiency"
-  Our style: "Attrition falls sharply from Band I (31%) to Band V (4%), confirming seniority protects retention"
+CHART TYPE GUIDE:
+  bar — simple categorical count (1 field)
+  grouped_bar — two categorical fields side by side (2 fields)
+  stacked_bar — composition stacked (2 fields)
+  horizontal_bar — when category label names are long (1-2 fields)
+  composed — bar + line dual axis for count + rate (2 fields)
+  donut — proportions, max 6 slices (1 field)
+  line — time trend using snapshot columns (1-2 fields)
+  table — multi-column detail view (2-4 fields)
 
-CHART TYPE SELECTION:
-  grouped_bar — two categories side by side (Active vs Inactive by Function, Male vs Female by Band)
-  stacked_bar — stacked composition (headcount by Band stacked by Contract_Type)
-  horizontal_bar — long category names (Job Role, Supervisory Org names)
-  composed — bar + line dual axis (Headcount bar + Attrition Rate line by Department)
-  donut — overall proportions max 6 slices (Active vs Inactive overall)
-  line — time trend with Snapshot_Month_Series
-  table — 3-5 column breakdowns with real numbers (Department, Count, Rate, Avg FTE)
-  bar — simple categorical (headcount by Region, by Gender)
+SUGGESTIONS: 5 follow-up prompts using real field names from the data.
 
-SUGGESTIONS: 5 specific follow-up prompts. Must reference actual field names.
-
-══════════════════════════════════════════
-RESPONSE — valid JSON only, no markdown:
-══════════════════════════════════════════
+=== RESPONSE FORMAT (valid JSON only, no markdown) ===
 {{
   "message": "One sentence confirming what was built.",
   "analysis_type": "workforce|attrition|headcount|demographics|org|custom",
-  "suggestions": [
-    "Show attrition by Band and Contract_Type",
-    "Add headcount trend by Snapshot_Month",
-    "Break down by Reporting_Region",
-    "Compare Blue vs White Collar inactive rates",
-    "Show top 10 Functions by inactive headcount"
-  ],
+  "suggestions": ["suggestion using real field name", "..."],
   "dashboard": {{
-    "title": "Short punchy title — max 6 words",
-    "overview": "1-2 sentences max. What it analyzes and why it matters.",
+    "title": "Short title — max 6 words",
+    "overview": "1-2 sentences about what this dashboard shows.",
     "overall_insights": [
-      "Operations accounts for 28% of all inactive employees",
-      "Internship contracts show 24% attrition — 3x the company average",
-      "EMEA region has 45% of workforce but only 38% of attrition",
-      "Band I-II employees represent 62% of all inactive cases",
-      "Female employees show 12% lower attrition than male counterparts"
+      "Insight 1 with real number from statistics",
+      "Insight 2 with real number and implication",
+      "Insight 3",
+      "Insight 4",
+      "Insight 5"
     ],
     "metrics": [
       {{
-        "label": "Total Active Headcount",
-        "value": "8,234",
-        "trend": "up",
-        "change": "+4.1% YoY",
-        "insight": "Growth concentrated in APAC and EMEA regions"
-      }},
-      {{
-        "label": "Overall Attrition Rate",
-        "value": "16.4%",
-        "trend": "up",
-        "change": "+2.1pp",
-        "insight": "Driven by internship and temporary contract exits"
-      }},
-      {{
-        "label": "Total FTE",
-        "value": "7,891.5",
-        "trend": "stable",
-        "change": "0.0%",
-        "insight": "Part-time roles offsetting headcount growth"
+        "label": "KPI label",
+        "value": "Number from statistics",
+        "trend": "up|down|stable",
+        "change": "change value if known",
+        "insight": "One sentence under 12 words"
       }}
     ],
     "visualizations": [
       {{
         "id": "viz-1",
-        "type": "donut",
-        "title": "Active vs Inactive Employee Distribution",
-        "description": "Overall workforce retention showing proportion of active vs inactive employees.",
-        "fields": ["Active_Workforce_Status"],
-        "data_hint": "active_workforce_status_counts",
+        "type": "chart_type",
+        "title": "Chart title",
+        "description": "One sentence describing what the chart shows.",
+        "fields": ["RealColumnName1", "RealColumnName2"],
+        "data_hint": "descriptive_hint_for_backend",
         "key_insights": [
-          "83.6% of employees are active — 8,234 of 9,848 total",
-          "1,614 inactive employees represent retention improvement opportunity"
-        ]
-      }},
-      {{
-        "id": "viz-2",
-        "type": "grouped_bar",
-        "title": "Active vs Inactive Employees by Function",
-        "description": "Headcount breakdown by business function comparing active vs inactive employees.",
-        "fields": ["Function", "Active_Workforce_Status"],
-        "data_hint": "function_by_active_status",
-        "key_insights": [
-          "Operations has highest inactive count at 28% of its workforce",
-          "Finance shows strongest retention at only 9% inactive rate",
-          "Sales and Operations together account for 58% of all inactive cases"
-        ]
-      }},
-      {{
-        "id": "viz-3",
-        "type": "bar",
-        "title": "Headcount by Reporting Region",
-        "description": "Geographic distribution of workforce across global reporting regions.",
-        "fields": ["Reporting_Region"],
-        "data_hint": "reporting_region_counts",
-        "key_insights": [
-          "EMEA leads with 45% of total workforce headcount",
-          "APAC shows fastest growth trajectory in recent snapshots"
-        ]
-      }},
-      {{
-        "id": "viz-4",
-        "type": "composed",
-        "title": "Inactive Count and Attrition Rate by Band",
-        "description": "Dual-axis view of absolute inactive counts (bar) and attrition rate (line) per band level.",
-        "fields": ["Band", "Active_Workforce_Status"],
-        "data_hint": "band_inactive_count_and_rate",
-        "key_insights": [
-          "Band I has highest attrition rate at 31% — 3x the senior band average",
-          "Band IV-V show under 5% attrition, correlating with higher seniority and pay"
-        ]
-      }},
-      {{
-        "id": "viz-5",
-        "type": "horizontal_bar",
-        "title": "Inactive Employees by Contract Type",
-        "description": "Breakdown of inactive headcount by employment contract type.",
-        "fields": ["Contract_Type", "Active_Workforce_Status"],
-        "data_hint": "contract_type_inactive",
-        "key_insights": [
-          "Internship contracts have highest attrition rate at 24% of segment",
-          "Permanent employees have lowest attrition at 8% — most stable group"
-        ]
-      }},
-      {{
-        "id": "viz-6",
-        "type": "stacked_bar",
-        "title": "Workforce Composition by Band and Worker Category",
-        "description": "Stacked view of worker categories within each band level.",
-        "fields": ["Band", "Worker_Category"],
-        "data_hint": "band_by_worker_category",
-        "key_insights": [
-          "Band I is 72% non-management, highest concentration of individual contributors",
-          "Management roles concentrated in Bands III-V at 68% share"
-        ]
-      }},
-      {{
-        "id": "viz-7",
-        "type": "table",
-        "title": "Attrition Summary by Function",
-        "description": "Detailed table showing headcount, inactive count, and attrition rate by function.",
-        "fields": ["Function", "Total", "Inactive", "Attrition Rate"],
-        "data_hint": "function_attrition_table",
-        "key_insights": [
-          "Operations: 2,756 total, 771 inactive — 28% attrition rate",
-          "Finance: 1,203 total, 108 inactive — best retention at 9%",
-          "HR and Sales both exceed 20% attrition, flagging retention risk"
-        ]
-      }},
-      {{
-        "id": "viz-8",
-        "type": "grouped_bar",
-        "title": "Gender Distribution by Function",
-        "description": "Male vs female headcount split across all business functions.",
-        "fields": ["Function", "Gender"],
-        "data_hint": "function_by_gender",
-        "key_insights": [
-          "Engineering is 78% male — highest gender skew in the organization",
-          "HR is 71% female, the most female-majority function",
-          "Overall workforce is 54% male across all functions combined"
+          "Specific finding with real number from data",
+          "What this implies for the business"
         ]
       }}
     ],
     "recommendations": [
-      "Launch targeted retention program for Operations and Sales — highest attrition functions",
-      "Review internship-to-permanent conversion rate — internships show 3x average attrition",
-      "Investigate Band I attrition drivers — 31% rate suggests early-career retention gap"
+      "Actionable recommendation based on data findings"
     ]
   }}
 }}
 
-If modifying existing dashboard: keep all existing visualizations, only add/change what was requested.
-Return the complete updated dashboard JSON with all sections.
+If modifying an existing dashboard: keep all existing visualizations, only add/change what was requested.
+Return the complete updated dashboard JSON.
 """
+
 
 
 def calculate_actual_data(viz_type, fields, data_hint="", active_filters=None):
