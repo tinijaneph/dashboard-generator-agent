@@ -178,7 +178,11 @@ const CustomLabel = ({ x, y, width, value, fill }) => {
 };
 
 const renderChart = (viz, theme) => {
-  const data = viz.computed_data || generateFallbackData(viz);
+  const data = viz.computed_data || [];
+  // If no real data has been computed yet, show empty state
+  if (data.length === 0 && viz.type !== 'table') {
+    return <EmptyChart theme={theme} vizType={viz.type} />;
+  }
   const C = theme.colors;
   const isDark = theme.bg === '#0f1117';
 
@@ -420,41 +424,24 @@ const renderChart = (viz, theme) => {
   );
 };
 
+// Renders an empty state when computed_data hasn't arrived yet
+const EmptyChart = ({ theme, vizType }) => (
+  <div style={{
+    height: 200, display: 'flex', flexDirection: 'column',
+    alignItems: 'center', justifyContent: 'center', gap: 8,
+    background: theme.surfaceAlt, borderRadius: 8, border: `1px dashed ${theme.border}`,
+  }}>
+    <div style={{ fontSize: 11, color: theme.textLight, textAlign: 'center', lineHeight: 1.6 }}>
+      Loading data…
+    </div>
+  </div>
+);
+
+// No hardcoded fallback data — charts only render real computed_data from the backend.
+// If computed_data is missing, show a loading/empty state instead of fake numbers.
 function generateFallbackData(viz) {
-  if (viz.type === 'pie' || viz.type === 'donut') return [
-    { name: 'Active', value: 820 }, { name: 'Inactive', value: 310 }, { name: 'On Leave', value: 120 }
-  ];
-  if (viz.type === 'line') return [
-    { name: 'Jan', Headcount: 980, Attrition: 82 }, { name: 'Feb', Headcount: 995, Attrition: 76 },
-    { name: 'Mar', Headcount: 1010, Attrition: 91 }, { name: 'Apr', Headcount: 1008, Attrition: 68 },
-    { name: 'May', Headcount: 1020, Attrition: 74 }, { name: 'Jun', Headcount: 1035, Attrition: 88 },
-  ];
-  if (viz.type === 'composed') return [
-    { name: 'Band I', Count: 420, Rate: 31 }, { name: 'Band II', Count: 310, Rate: 18 },
-    { name: 'Band III', Count: 220, Rate: 12 }, { name: 'Band IV', Count: 140, Rate: 7 }, { name: 'Band V', Count: 80, Rate: 4 },
-  ];
-  if (viz.type === 'stacked_bar') return [
-    { name: 'Finance', Permanent: 280, Temporary: 95, Internship: 45 },
-    { name: 'Sales', Permanent: 210, Temporary: 120, Internship: 80 },
-    { name: 'HR', Permanent: 190, Temporary: 60, Internship: 30 },
-    { name: 'IT', Permanent: 340, Temporary: 85, Internship: 55 },
-    { name: 'Operations', Permanent: 260, Temporary: 140, Internship: 90 },
-  ];
-  if (viz.type === 'grouped_bar') return [
-    { name: 'Finance', Active: 280, Inactive: 108 }, { name: 'Marketing', Active: 320, Inactive: 130 },
-    { name: 'Sales', Active: 354, Inactive: 92 }, { name: 'HR', Active: 310, Inactive: 118 },
-    { name: 'IT', Active: 295, Inactive: 115 }, { name: 'Operations', Active: 340, Inactive: 130 },
-  ];
-  if (viz.type === 'table') return [];
-  if (viz.type === 'horizontal_bar') return [
-    { name: 'Operations', Inactive: 420 }, { name: 'Sales', Inactive: 354 },
-    { name: 'Marketing', Inactive: 298 }, { name: 'IT', Inactive: 241 },
-    { name: 'Finance', Inactive: 189 }, { name: 'HR', Inactive: 112 },
-  ];
-  return [
-    { name: 'EMEA', value: 3840 }, { name: 'APAC', value: 2950 },
-    { name: 'Americas', value: 2180 }, { name: 'MEA', value: 880 },
-  ];
+  // Return empty — the chart renderer handles the empty state gracefully
+  return [];
 }
 
 // ─── TREND BADGE ─────────────────────────────────────────────────────────────
@@ -590,20 +577,11 @@ const DashboardAgent = () => {
     } catch (e) {
       console.warn('Schema fetch failed, using defaults', e);
     }
-    // Fallback defaults if fetch failed or returned nothing
+    // If API fetch failed, show a single placeholder so the filter still renders
+    // Real values will populate once data is available
     if (options.length === 0) {
-      const defaults = {
-        'Function': ['Finance','Marketing','Sales','HR','IT','Operations'],
-        'Reporting_Region': ['EMEA','APAC','Americas','MEA'],
-        'Band': ['Band I','Band II','Band III','Band IV','Band V'],
-        'Contract_Type': ['Permanent','Temporary','Internship','Freelance'],
-        'Snapshot_Year': ['2022','2023','2024','2025'],
-        'Gender': ['Male','Female'],
-        'Blue_White_Collar': ['Blue Collar','White Collar'],
-        'Worker_Category': ['Employee','Contractor','Intern'],
-        'Active_Workforce_Status': ['Active','Inactive','On Leave'],
-      };
-      options = defaults[field] || [];
+      console.warn(`No values found for filter field: ${field}. Check /api/schema endpoint.`);
+      options = [`(loading ${field}…)`];
     }
     setActiveFilters(p => [...p, { field, options, selected: [...options] }]);
     setOpenFilterDropdown(field);
