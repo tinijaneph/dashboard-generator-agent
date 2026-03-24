@@ -566,20 +566,45 @@ const DashboardAgent = () => {
   };
 
   // ── Filter helpers ──────────────────────────────────────────────────────
-  const addFilter = (field) => {
+  // Fetch real category values from backend /api/schema, fall back to defaults
+  const addFilter = async (field) => {
     if (activeFilters.find(f => f.field === field)) return;
-    // Extract unique values from dashboard visualizations or use defaults
-    const defaults = {
-      'Function': ['Finance','Marketing','Sales','HR','IT','Operations'],
-      'Reporting_Region': ['EMEA','APAC','Americas','MEA'],
-      'Band': ['Band I','Band II','Band III','Band IV','Band V'],
-      'Contract_Type': ['Permanent','Temporary','Internship','Freelance'],
-      'Snapshot_Year': ['2022','2023','2024','2025'],
-      'Gender': ['Male','Female'],
-      'Blue_White_Collar': ['Blue Collar','White Collar'],
-      'Worker_Category': ['Employee','Contractor','Intern'],
-    };
-    const options = defaults[field] || [field];
+    let options = [];
+    try {
+      const res = await fetch(`${API_URL}/api/schema`);
+      const schema = await res.json();
+      // Use distinct_values (real categories from latest snapshot) if available
+      const dv = schema.distinct_values || {};
+      if (dv[field] && dv[field].length > 0) {
+        options = dv[field];
+      } else {
+        // Fall back to chart-data endpoint for any field not in distinct_values
+        const dataRes = await fetch(`${API_URL}/api/chart-data`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: 'bar', fields: [field], data_hint: '' }),
+        });
+        const dataJson = await dataRes.json();
+        options = (dataJson.data || []).map(d => d.name).filter(Boolean);
+      }
+    } catch (e) {
+      console.warn('Schema fetch failed, using defaults', e);
+    }
+    // Fallback defaults if fetch failed or returned nothing
+    if (options.length === 0) {
+      const defaults = {
+        'Function': ['Finance','Marketing','Sales','HR','IT','Operations'],
+        'Reporting_Region': ['EMEA','APAC','Americas','MEA'],
+        'Band': ['Band I','Band II','Band III','Band IV','Band V'],
+        'Contract_Type': ['Permanent','Temporary','Internship','Freelance'],
+        'Snapshot_Year': ['2022','2023','2024','2025'],
+        'Gender': ['Male','Female'],
+        'Blue_White_Collar': ['Blue Collar','White Collar'],
+        'Worker_Category': ['Employee','Contractor','Intern'],
+        'Active_Workforce_Status': ['Active','Inactive','On Leave'],
+      };
+      options = defaults[field] || [];
+    }
     setActiveFilters(p => [...p, { field, options, selected: [...options] }]);
     setOpenFilterDropdown(field);
     setActionPanel(null);
@@ -591,15 +616,96 @@ const DashboardAgent = () => {
   };
 
   const toggleFilterOption = (field, option) => {
-    setActiveFilters(p => p.map(f => f.field === field
-      ? { ...f, selected: f.selected.includes(option) ? f.selected.filter(o => o !== option) : [...f.selected, option] }
-      : f));
+    setActiveFilters(p => {
+      const updated = p.map(f => f.field === field
+        ? { ...f, selected: f.selected.includes(option) ? f.selected.filter(o => o !== option) : [...f.selected, option] }
+        : f);
+      // Recompute charts immediately after filter change
+      if (dashboard) recomputeChartsWithFilters(updated, dashboard);
+      return updated;
+    });
   };
 
   const toggleAllFilter = (field) => {
-    setActiveFilters(p => p.map(f => f.field === field
-      ? { ...f, selected: f.selected.length === f.options.length ? [] : [...f.options] }
-      : f));
+    setActiveFilters(p => {
+      const updated = p.map(f => f.field === field
+        ? { ...f, selected: f.selected.length === f.options.length ? [] : [...f.options] }
+        : f);
+      if (dashboard) recomputeChartsWithFilters(updated, dashboard);
+      return updated;
+    });
+  };
+
+  const removeFilterAndRecompute = (field) => {
+    setActiveFilters(p => {
+      const updated = p.filter(f => f.field !== field);
+      if (dashboard) recomputeChartsWithFilters(updated, dashboard);
+      return updated;
+    });
+    setOpenFilterDropdown(null);
+  };
+
+  // Convert activeFilters array to the dict format backend expects: {field: [values]}
+  const buildFilterDict = (filters) => {
+    const dict = {};
+    filters.forEach(f => {
+      // Only include filter if it's NOT selecting everything (partial selection = actual filter)
+      if (f.selected.length > 0 && f.selected.length < f.options.length) {
+        dict[f.field] = f.selected;
+      }
+    });
+    return dict;
+  };
+
+  // Recompute all chart data when filters change — this is what makes filters actually work
+  const recomputeChartsWithFilters = async (newFilters, currentDashboard) => {
+    if (!currentDashboard?.visualizations) return;
+    const filterDict = buildFilterDict(newFilters);
+    const updated = await Promise.all(
+      currentDashboard.visualizations.map(async (viz) => {
+        try {
+          const res = await fetch(`${API_URL}/api/chart-data`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              type: viz.type,
+              fields: viz.fields || [],
+              data_hint: viz.data_hint || '',
+              active_filters: filterDict,
+            }),
+          });
+          const json = await res.json();
+          return json.data?.length > 0 ? { ...viz, computed_data: json.data } : viz;
+        } catch { return viz; }
+      })
+    );
+    setChats(p => p.map(c => c.id === activeChat
+      ? { ...c, dashboard: { ...currentDashboard, visualizations: updated } }
+      : c));
+  };
+
+  // Deeper insights — calls dedicated endpoint with actual computed data
+  const handleDeeperInsights = async () => {
+    if (!dashboard) return;
+    setLoading(true);
+    setGenStep('Analyzing actual data for deeper insights…');
+    setActionPanel(null);
+    try {
+      const filterDict = buildFilterDict(activeFilters);
+      const res = await fetch(`${API_URL}/api/deeper-insights`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dashboard, active_filters: filterDict }),
+      });
+      const data = await res.json();
+      if (data.dashboard) {
+        setChats(p => p.map(c => c.id === activeChat
+          ? { ...c, dashboard: data.dashboard, messages: [...c.messages, { role: 'assistant', content: data.message || 'Insights refreshed with actual data.' }] }
+          : c));
+      }
+    } catch (err) {
+      console.error(err);
+    } finally { setLoading(false); setGenStep(''); }
   };
 
   const sendMessage = useCallback(async (message, chatId, history) => {
@@ -617,7 +723,12 @@ const DashboardAgent = () => {
       const res = await fetch(`${API_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, history: (history || currentChat?.messages || []).slice(-6), current_dashboard: currentChat?.dashboard || null }),
+        body: JSON.stringify({
+          message,
+          history: (history || currentChat?.messages || []).slice(-6),
+          current_dashboard: currentChat?.dashboard || null,
+          active_filters: buildFilterDict(activeFilters),
+        }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setGenStep('Rendering visualizations…');
@@ -850,9 +961,12 @@ const DashboardAgent = () => {
 
               {actionPanel === 'insights' && (
                 <div style={{ padding: 9, borderBottom: `1px solid ${theme.border}`, background: theme.surfaceAlt }}>
-                  <button onClick={() => { setActionPanel(null); handleSuggestionSend('Give me 5 deeper key insights from this dashboard with specific numbers, percentages and actionable recommendations'); }}
-                    style={{ width: '100%', padding: 8, background: theme.accent, border: 'none', borderRadius: 7, cursor: 'pointer', fontSize: 12, color: '#fff', fontWeight: 600 }}>
-                    Generate deeper insights
+                  <div style={{ fontSize: 11, color: theme.textMuted, marginBottom: 7, lineHeight: 1.5 }}>
+                    Recalculates all key insights using actual data from your dataset{activeFilters.length > 0 ? ', filtered to your current selections' : ''}.
+                  </div>
+                  <button onClick={handleDeeperInsights}
+                    style={{ width: '100%', padding: 8, background: theme.accent, border: 'none', borderRadius: 7, cursor: 'pointer', fontSize: 12, color: '#fff', fontWeight: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                    <Lightbulb className="w-3.5 h-3.5" /> Refresh insights from data
                   </button>
                 </div>
               )}
@@ -930,7 +1044,7 @@ const DashboardAgent = () => {
                       <div key={f.field} style={{ position: 'relative' }}>
                         <button onClick={() => setOpenFilterDropdown(openFilterDropdown === f.field ? null : f.field)}
                           style={{ display: 'flex', alignItems: 'center', gap: 5, padding: '5px 10px', borderRadius: 6, border: `1px solid ${theme.border}`, background: theme.surface, color: theme.text, cursor: 'pointer', fontSize: 12, fontWeight: 500, boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
-                          <Trash2 className="w-3 h-3" style={{ color: theme.textMuted, cursor: 'pointer' }} onClick={e => { e.stopPropagation(); removeFilter(f.field); }} />
+                          <Trash2 className="w-3 h-3" style={{ color: theme.textMuted, cursor: 'pointer' }} onClick={e => { e.stopPropagation(); removeFilterAndRecompute(f.field); }} />
                           {f.field}
                           <span style={{ background: theme.accent, color: '#fff', borderRadius: 99, padding: '1px 6px', fontSize: 10, fontWeight: 700 }}>
                             {f.selected.length === f.options.length ? `All (${f.options.length})` : f.selected.length}
