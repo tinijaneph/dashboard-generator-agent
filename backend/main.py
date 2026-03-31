@@ -1,741 +1,1505 @@
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import vertexai
-from vertexai.preview.generative_models import GenerativeModel
-import os
-import json
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+import plotly.graph_objects as go
+import plotly.express as px
 import pandas as pd
-import io
-from datetime import datetime
-from google.cloud import storage
+import json
+import os
+import random
+from datetime import datetime, timedelta
 
-app = Flask(__name__)
-CORS(app, origins="*", allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "OPTIONS"])
+app = FastAPI(title="Employee Dashboard Agent - Enhanced")
 
 # Initialize Vertex AI
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "molten-album-478703-d8")
-LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
-BUCKET_NAME = os.environ.get("GCS_BUCKET", "dashboard-generator-data")
-DATA_FILE_GCS = os.environ.get("GCS_FILE", "nominative_list.csv")
-DATA_FILE_LOCAL = os.environ.get("LOCAL_DATA_FILE", "data/nominative_list.csv")
+PROJECT_ID = os.getenv("PROJECT_ID", "molten-album-478703-d8")
+LOCATION = "us-central1"
 
-vertexai.init(project=PROJECT_ID, location=LOCATION)
-model = GenerativeModel("gemini-2.0-flash-001")
-
-_df_cache = None
-
-def load_dataset():
-    global _df_cache
-    if _df_cache is not None:
-        return _df_cache
-    # Try GCS first
+try:
+    from google.cloud import aiplatform
+    import vertexai
     try:
-        client = storage.Client(project=PROJECT_ID)
-        bucket = client.bucket(BUCKET_NAME)
-        blob = bucket.blob(DATA_FILE_GCS)
-        content = blob.download_as_bytes()
-        df = pd.read_csv(io.BytesIO(content))
-        _df_cache = df
-        print(f"Loaded {len(df)} rows from GCS gs://{BUCKET_NAME}/{DATA_FILE_GCS}")
-        return df
-    except Exception as e:
-        print(f"GCS load failed: {e}, trying local...")
-    # Fallback local
-    try:
-        df = pd.read_csv(DATA_FILE_LOCAL)
-        _df_cache = df
-        print(f"Loaded {len(df)} rows from local {DATA_FILE_LOCAL}")
-        return df
-    except Exception as e:
-        print(f"Local load failed: {e}")
-        return None
-
-
-def get_latest_snapshot(df):
-    """
-    Returns a DataFrame scoped to the single latest snapshot only.
-    This is critical because the CSV is a longitudinal record — each employee
-    can appear many times (one row per snapshot month). We never want to count
-    raw rows; we always want distinct employees at the most recent point in time.
-
-    Priority:
-    1. Is_Latest_Snapshot == True  (explicit flag in data)
-    2. Most recent Snapshot_Month_Series timestamp
-    3. Most recent Snapshot_Year + Snapshot_Month combination
-    4. Full DataFrame as last resort (with a warning)
-    """
-    # Option 1: explicit flag
-    if "Is_Latest_Snapshot" in df.columns:
-        latest = df[df["Is_Latest_Snapshot"].astype(str).str.lower().isin(["true", "1", "yes"])]
-        if len(latest) > 0:
-            return latest, "Is_Latest_Snapshot flag"
-
-    # Option 2: timestamp column
-    if "Snapshot_Month_Series" in df.columns:
+        from vertexai.generative_models import GenerativeModel
+        VERTEX_AI_ENABLED = True
+    except ImportError:
         try:
-            df["_ts"] = pd.to_datetime(df["Snapshot_Month_Series"], errors="coerce")
-            max_ts = df["_ts"].max()
-            latest = df[df["_ts"] == max_ts].drop(columns=["_ts"])
-            if len(latest) > 0:
-                return latest, f"Snapshot_Month_Series={max_ts}"
-        except Exception:
-            pass
-
-    # Option 3: year + month combo
-    if "Snapshot_Year" in df.columns and "Snapshot_Month" in df.columns:
+            from vertexai.preview.generative_models import GenerativeModel
+            VERTEX_AI_ENABLED = True
+        except ImportError:
+            GenerativeModel = None
+            VERTEX_AI_ENABLED = False
+    
+    if VERTEX_AI_ENABLED:
         try:
-            df["_ym"] = df["Snapshot_Year"].astype(str) + "-" + df["Snapshot_Month"].astype(str).str.zfill(2)
-            max_ym = df["_ym"].max()
-            latest = df[df["_ym"] == max_ym].drop(columns=["_ym"])
-            if len(latest) > 0:
-                return latest, f"Snapshot {max_ym}"
-        except Exception:
-            pass
-
-    # Fallback
-    print("WARNING: Could not isolate latest snapshot — using full dataset")
-    return df, "full dataset (no snapshot column found)"
-
-
-def compute_descriptive_stats(df):
-    """
-    Compute real descriptive statistics from any DataFrame.
-    Returns a dict of {field: {value: count}} for every categorical column,
-    plus numeric summaries for numeric columns.
-    This is completely data-driven — no field names or values are assumed.
-    """
-    stats = {}
-    for col in df.columns:
-        non_null = df[col].dropna()
-        if len(non_null) == 0:
-            continue
-        # Detect numeric
-        numeric = pd.to_numeric(non_null, errors='coerce').dropna()
-        if len(numeric) / max(len(non_null), 1) > 0.8:
-            # Numeric column
-            stats[col] = {
-                "type": "numeric",
-                "count": int(len(numeric)),
-                "mean": round(float(numeric.mean()), 2),
-                "median": round(float(numeric.median()), 2),
-                "min": round(float(numeric.min()), 2),
-                "max": round(float(numeric.max()), 2),
-            }
-        else:
-            # Categorical column
-            vc = non_null.astype(str).value_counts()
-            n_unique = len(vc)
-            # Only include if cardinality is useful (2-200 unique values)
-            if 2 <= n_unique <= 200:
-                stats[col] = {
-                    "type": "categorical",
-                    "n_unique": n_unique,
-                    "top_values": {str(k): int(v) for k, v in vc.head(15).items()},
-                }
-    return stats
-
-
-def get_data_summary():
-    """
-    Builds a 100% data-driven summary from whatever CSV is loaded.
-    No field names, values, or counts are hardcoded anywhere.
-    The summary reflects the actual data at the latest snapshot point-in-time.
-    If the data changes (new fields, different categories, more/fewer employees),
-    this function automatically reflects those changes without any code modification.
-    """
-    df_raw = load_dataset()
-    if df_raw is None:
-        return "Dataset not available."
-
-    df, snapshot_label = get_latest_snapshot(df_raw)
-
-    # Distinct employee count — try common ID columns, fall back to row count
-    id_col = next((c for c in ["Corporate_ID", "Nominative_List_Unique_ID", "Employee_ID", "EmpID"]
-                   if c in df.columns), None)
-    distinct_employees = int(df[id_col].nunique()) if id_col else len(df)
-
-    # Date range from full longitudinal data
-    date_range = ""
-    if "Snapshot_Month_Series" in df_raw.columns:
-        try:
-            ts = pd.to_datetime(df_raw["Snapshot_Month_Series"], errors="coerce")
-            date_range = f"{ts.min().strftime('%Y-%m')} to {ts.max().strftime('%Y-%m')}"
-        except Exception:
-            pass
-
-    # Build header
-    lines = [
-        f"=== DATASET STATISTICS (computed from actual data) ===",
-        f"Snapshot: {snapshot_label}",
-        f"Distinct employees (latest snapshot): {distinct_employees:,}",
-        f"Total longitudinal rows: {len(df_raw):,}",
-        f"Columns available ({len(df.columns)}): {', '.join(df.columns.tolist())}",
-    ]
-    if date_range:
-        lines.append(f"Date range covered: {date_range}")
-
-    # Compute descriptive stats on latest snapshot
-    stats = compute_descriptive_stats(df)
-
-    lines.append("")
-    lines.append("=== FIELD STATISTICS (actual values from latest snapshot) ===")
-
-    for col, s in stats.items():
-        if s["type"] == "categorical":
-            # Format: FIELD_NAME (N unique): {"Val1": count, "Val2": count, ...}
-            lines.append(f'{col} ({s["n_unique"]} unique): {json.dumps(s["top_values"])}')
-        elif s["type"] == "numeric":
-            lines.append(
-                f'{col} [numeric]: mean={s["mean"]}, median={s["median"]}, '
-                f'min={s["min"]}, max={s["max"]}, n={s["count"]:,}'
-            )
-
-    lines.append("")
-    lines.append(
-        "=== INSTRUCTION TO AI ===\n"
-        "The statistics above are the ONLY source of truth. "
-        "Use ONLY the field names listed in 'Columns available'. "
-        "Use ONLY the values shown in the field statistics above — never invent category names. "
-        "Use the exact counts shown for KPI values and insights. "
-        "Distinct employees = total headcount at latest snapshot."
-    )
-
-    return "\n".join(lines)
-
-
-
-SYSTEM_PROMPT = """You are an expert HR Analytics AI that generates data-driven dashboards.
-
-You receive computed statistics from the actual dataset. Your job is to:
-1. Read the field statistics and understand what the data contains
-2. Select the most relevant fields for the user's request
-3. Generate a dashboard JSON that reflects the REAL data — using only field names and values that exist in the statistics
-
-=== DATA CONTEXT ===
-{data_summary}
-
-=== CRITICAL RULES ===
-- NEVER use field names not listed in "Columns available"
-- NEVER invent category values — use ONLY values shown in the field statistics
-- NEVER use hardcoded numbers — derive all values from the statistics above
-- KPI values must come from the statistics (e.g. distinct employees = total headcount)
-- Chart fields must be real columns. Category names in insights must match actual values.
-- The data is longitudinal (one employee can have many rows over time). Always work from the latest snapshot counts.
-
-=== OUTPUT FORMAT RULES ===
-
-OVERVIEW: 1-2 sentences. What the dashboard analyzes + why it matters. No lists.
-
-OVERALL_INSIGHTS: Exactly 5 bullets. Each must:
-  - Quote a real number derived from the statistics
-  - Be under 20 words
-  - State a finding + implication (not just a description)
-
-METRICS: 3-5 KPI cards derived from actual statistics.
-
-VISUALIZATIONS: 6-8 charts. For each:
-  - "fields" must only contain column names that exist in the data
-  - "key_insights": exactly 2-3 bullets, each under 15 words with a real number
-  - First bullet = specific number. Second bullet = what it implies for the business.
-
-CHART TYPE GUIDE:
-  bar — simple categorical count (1 field)
-  grouped_bar — two categorical fields side by side (2 fields)
-  stacked_bar — composition stacked (2 fields)
-  horizontal_bar — when category label names are long (1-2 fields)
-  composed — bar + line dual axis for count + rate (2 fields)
-  donut — proportions, max 6 slices (1 field)
-  line — time trend using snapshot columns (1-2 fields)
-  table — multi-column detail view (2-4 fields)
-
-SUGGESTIONS: 5 follow-up prompts using real field names from the data.
-
-=== RESPONSE FORMAT (valid JSON only, no markdown) ===
-{{
-  "message": "One sentence confirming what was built.",
-  "analysis_type": "workforce|attrition|headcount|demographics|org|custom",
-  "suggestions": ["suggestion using real field name", "..."],
-  "dashboard": {{
-    "title": "Short title — max 6 words",
-    "overview": "1-2 sentences about what this dashboard shows.",
-    "overall_insights": [
-      "Insight 1 with real number from statistics",
-      "Insight 2 with real number and implication",
-      "Insight 3",
-      "Insight 4",
-      "Insight 5"
-    ],
-    "metrics": [
-      {{
-        "label": "KPI label",
-        "value": "Number from statistics",
-        "trend": "up|down|stable",
-        "change": "change value if known",
-        "insight": "One sentence under 12 words"
-      }}
-    ],
-    "visualizations": [
-      {{
-        "id": "viz-1",
-        "type": "chart_type",
-        "title": "Chart title",
-        "description": "One sentence describing what the chart shows.",
-        "fields": ["RealColumnName1", "RealColumnName2"],
-        "data_hint": "descriptive_hint_for_backend",
-        "key_insights": [
-          "Specific finding with real number from data",
-          "What this implies for the business"
-        ]
-      }}
-    ],
-    "recommendations": [
-      "Actionable recommendation based on data findings"
-    ]
-  }}
-}}
-
-If modifying an existing dashboard: keep all existing visualizations, only add/change what was requested.
-Return the complete updated dashboard JSON.
-"""
-
-
-
-def calculate_actual_data(viz_type, fields, data_hint="", active_filters=None):
-    """
-    Compute real chart data from the dataset.
-
-    Always scopes to the LATEST SNAPSHOT for point-in-time accuracy.
-    For line/trend charts, uses the FULL longitudinal dataset grouped by snapshot.
-
-    active_filters: dict of {field_name: [selected_values]} — applied before aggregation.
-    This is how the UI filter bar actually changes chart data.
-    """
-    df_raw = load_dataset()
-    if df_raw is None:
-        return []
-
-    try:
-        hint = (data_hint or "").lower()
-        primary_field = fields[0] if fields else None
-        secondary_field = fields[1] if len(fields) > 1 else None
-
-        # Line/trend charts need the full longitudinal data grouped by snapshot
-        is_time_series = viz_type == "line" or "trend" in hint or "time" in hint or "month" in hint
-
-        if is_time_series:
-            df = df_raw.copy()
-        else:
-            # All other charts: scope to latest snapshot only
-            df, _ = get_latest_snapshot(df_raw)
-
-        # Apply active UI filters (this is what makes filter chips actually work)
-        if active_filters:
-            for filter_field, selected_values in active_filters.items():
-                if filter_field in df.columns and selected_values:
-                    df = df[df[filter_field].astype(str).isin([str(v) for v in selected_values])]
-
-        if len(df) == 0:
-            return []
-
-        # ── TABLE ─────────────────────────────────────────────────────────────
-        if viz_type == "table":
-            valid_fields = [f for f in fields if f in df.columns]
-            if not valid_fields:
-                return []
-            group_col = valid_fields[0]
-
-            # Try to build a rich table: headcount + breakdown by second field if available
-            if secondary_field and secondary_field in df.columns:
-                grp = df.groupby([group_col, secondary_field]).size().reset_index(name="Count")
-                # Pivot so each value of secondary becomes a column
-                pivoted = grp.pivot_table(index=group_col, columns=secondary_field, values="Count", fill_value=0)
-                pivoted["Total"] = pivoted.sum(axis=1)
-                pivoted = pivoted.sort_values("Total", ascending=False).head(10)
-                pivoted = pivoted.reset_index()
-                # Round and convert
-                result = []
-                for _, row in pivoted.iterrows():
-                    result.append({str(k): (int(v) if isinstance(v, (int, float)) else str(v)) for k, v in row.items()})
-                return result
-            else:
-                # Simple count table
-                counts = df[group_col].value_counts().head(10).reset_index()
-                counts.columns = [group_col, "Count"]
-                # Add percentage column
-                counts["Rate %"] = (counts["Count"] / counts["Count"].sum() * 100).round(1).astype(str) + "%"
-                return counts.to_dict("records")
-
-        # ── GROUPED / STACKED BAR — requires two fields ───────────────────────
-        elif viz_type in ("grouped_bar", "stacked_bar"):
-            if primary_field and secondary_field and primary_field in df.columns and secondary_field in df.columns:
-                grp = df.groupby([primary_field, secondary_field]).size().reset_index(name="count")
-                pivoted = grp.pivot_table(index=primary_field, columns=secondary_field, values="count", fill_value=0)
-                # Sort by total descending, keep top 8 categories
-                pivoted["_total"] = pivoted.sum(axis=1)
-                pivoted = pivoted.sort_values("_total", ascending=False).head(8).drop(columns=["_total"])
-                result = []
-                for idx, row in pivoted.iterrows():
-                    entry = {"name": str(idx)}
-                    for col in pivoted.columns:
-                        entry[str(col)] = int(row[col])
-                    result.append(entry)
-                return result
-            elif primary_field and primary_field in df.columns:
-                counts = df[primary_field].value_counts().head(8)
-                return [{"name": str(k), "value": int(v)} for k, v in counts.items()]
-
-        # ── SIMPLE BAR ────────────────────────────────────────────────────────
-        elif viz_type == "bar":
-            if primary_field and primary_field in df.columns:
-                counts = df[primary_field].value_counts().head(10)
-                return [{"name": str(k), "value": int(v)} for k, v in counts.items()]
-
-        # ── HORIZONTAL BAR ───────────────────────────────────────────────────
-        elif viz_type == "horizontal_bar":
-            if primary_field and secondary_field and primary_field in df.columns and secondary_field in df.columns:
-                grp = df.groupby([primary_field, secondary_field]).size().reset_index(name="count")
-                pivoted = grp.pivot_table(index=primary_field, columns=secondary_field, values="count", fill_value=0)
-                pivoted["_total"] = pivoted.sum(axis=1)
-                pivoted = pivoted.sort_values("_total", ascending=False).head(10).drop(columns=["_total"])
-                result = []
-                for idx, row in pivoted.iterrows():
-                    entry = {"name": str(idx)}
-                    for col in pivoted.columns:
-                        entry[str(col)] = int(row[col])
-                    result.append(entry)
-                return result
-            elif primary_field and primary_field in df.columns:
-                counts = df[primary_field].value_counts().head(10)
-                return [{"name": str(k), "value": int(v)} for k, v in counts.items()]
-
-        # ── LINE / TIME SERIES — uses full longitudinal data ─────────────────
-        elif viz_type == "line":
-            if "Snapshot_Month_Series" in df.columns:
-                try:
-                    df["_ts"] = pd.to_datetime(df["Snapshot_Month_Series"], errors="coerce")
-                    grp = df.dropna(subset=["_ts"]).groupby("_ts")
-                    if secondary_field and secondary_field in df.columns:
-                        # Multi-series: one line per value of secondary_field
-                        pivoted = df.dropna(subset=["_ts"]).groupby(["_ts", secondary_field]).size().reset_index(name="count")
-                        top_vals = df[secondary_field].value_counts().head(4).index.tolist()
-                        pivoted = pivoted[pivoted[secondary_field].isin(top_vals)]
-                        piv = pivoted.pivot_table(index="_ts", columns=secondary_field, values="count", fill_value=0).reset_index()
-                        piv = piv.sort_values("_ts")
-                        result = []
-                        for _, row in piv.iterrows():
-                            entry = {"name": str(row["_ts"])[:7]}
-                            for col in piv.columns:
-                                if col != "_ts":
-                                    entry[str(col)] = int(row[col])
-                            result.append(entry)
-                        return result
-                    else:
-                        ts = grp.size().reset_index(name="value").sort_values("_ts")
-                        return [{"name": str(r["_ts"])[:7], "value": int(r["value"])} for _, r in ts.iterrows()]
-                except Exception as e:
-                    print(f"Time series error: {e}")
-            elif "Snapshot_Year" in df.columns:
-                ts = df.groupby("Snapshot_Year").size().reset_index(name="value")
-                return [{"name": str(r["Snapshot_Year"]), "value": int(r["value"])} for _, r in ts.iterrows()]
-
-        # ── COMPOSED — bar + line (e.g. count bar + rate line) ───────────────
-        elif viz_type == "composed":
-            if primary_field and primary_field in df.columns:
-                counts = df[primary_field].value_counts().head(8)
-                result = []
-                for k, v in counts.items():
-                    subset = df[df[primary_field] == k]
-                    entry = {"name": str(k), "Count": int(v)}
-                    # If there's a status field, compute a rate
-                    if "Active_Workforce_Status" in df.columns:
-                        inactive = len(subset[subset["Active_Workforce_Status"].astype(str).str.lower() != "active"])
-                        rate = round(inactive / v * 100, 1) if v > 0 else 0
-                        entry["Attrition Rate %"] = rate
-                    elif secondary_field and secondary_field in df.columns:
-                        try:
-                            val = pd.to_numeric(subset[secondary_field], errors="coerce").mean()
-                            entry[secondary_field] = round(float(val), 2) if not pd.isna(val) else 0
-                        except Exception:
-                            pass
-                    result.append(entry)
-                return result
-
-        # ── PIE / DONUT ───────────────────────────────────────────────────────
-        elif viz_type in ("pie", "donut"):
-            if primary_field and primary_field in df.columns:
-                counts = df[primary_field].value_counts().head(6)
-                return [{"name": str(k), "value": int(v)} for k, v in counts.items()]
-
-    except Exception as e:
-        import traceback
-        print(f"Data calculation error: {e}")
-        traceback.print_exc()
-
-    return []
-
-
-@app.route("/health", methods=["GET"])
-def health_check():
-    df = load_dataset()
-    return jsonify({
-        "status": "healthy",
-        "project_id": PROJECT_ID,
-        "model": "gemini-2.0-flash-001",
-        "dataset_loaded": df is not None,
-        "records": len(df) if df is not None else 0,
-    })
-
-
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    try:
-        data = request.json
-        user_message = data.get("message", "")
-        conversation_history = data.get("history", [])
-        current_dashboard = data.get("current_dashboard", None)
-
-        active_filters = data.get("active_filters", {})  # {field: [selected_values]}
-
-        data_summary = get_data_summary()
-        context = SYSTEM_PROMPT.format(data_summary=data_summary) + "\n\n"
-
-        if current_dashboard:
-            context += f"""CURRENT DASHBOARD (modify, don't replace):
-{json.dumps(current_dashboard, indent=2)}
-
-Instructions: The user wants to MODIFY this dashboard. Add/change only what they request.
-Keep all existing visualizations. Return the complete updated dashboard JSON.\n\n"""
-
-        if active_filters:
-            filter_desc = ", ".join([f"{k}={v}" for k, v in active_filters.items()])
-            context += f"ACTIVE FILTERS (data is pre-filtered to these values): {filter_desc}\n\n"
-
-        for msg in conversation_history[-6:]:  # last 3 turns
-            role = "User" if msg["role"] == "user" else "Assistant"
-            context += f"{role}: {msg['content']}\n\n"
-
-        context += f"User: {user_message}\n\nAssistant (valid JSON only, no markdown):"
-
-        response = model.generate_content(
-            context,
-            generation_config={
-                "max_output_tokens": 8192,
-                "temperature": 0.25,
-                "top_p": 0.9,
-            },
-        )
-
-        raw = response.text.strip()
-        for fence in ["```json", "```"]:
-            if fence in raw:
-                start = raw.find(fence) + len(fence)
-                end = raw.rfind("```")
-                raw = raw[start:end].strip()
-                break
-
-        try:
-            parsed = json.loads(raw)
+            vertexai.init(project=PROJECT_ID, location=LOCATION)
         except Exception as e:
-            print(f"JSON parse error: {e}\nRaw: {raw[:500]}")
-            parsed = {
-                "message": "Dashboard generated. Displaying results.",
-                "dashboard": current_dashboard,
-                "suggestions": ["Try again", "Add a chart", "Explore themes"],
-            }
+            VERTEX_AI_ENABLED = False
+            print(f"Vertex AI initialization failed: {e}")
+except:
+    VERTEX_AI_ENABLED = False
+    print("Vertex AI not available - using fallback query parsing")
 
-        # Enrich visualizations with actual computed data (respecting active filters)
-        dashboard = parsed.get("dashboard")
-        if dashboard and "visualizations" in dashboard:
-            for viz in dashboard["visualizations"]:
-                fields = viz.get("fields", [])
-                hint = viz.get("data_hint", "")
-                computed = calculate_actual_data(viz["type"], fields, hint, active_filters)
-                if computed:
-                    viz["computed_data"] = computed
+# ============================================================================
+# FAKE DATA GENERATION
+# ============================================================================
 
-        return jsonify({
-            "response": parsed.get("message", "Dashboard generated."),
-            "dashboard": dashboard,
-            "suggestions": parsed.get("suggestions", []),
-            "analysis_type": parsed.get("analysis_type", "custom"),
-            "timestamp": datetime.now().isoformat(),
-        })
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e), "message": "Error processing request."}), 500
-
-
-@app.route("/api/chart-data", methods=["POST"])
-def get_chart_data():
-    """
-    Compute real chart data for a given visualization config.
-    Accepts active_filters to recompute filtered chart data when user changes filter selections.
-    """
-    try:
-        data = request.json
-        viz_type = data.get("type", "bar")
-        fields = data.get("fields", [])
-        hint = data.get("data_hint", "")
-        active_filters = data.get("active_filters", {})
-        computed = calculate_actual_data(viz_type, fields, hint, active_filters)
-        return jsonify({"data": computed})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/deeper-insights", methods=["POST"])
-def deeper_insights():
-    """
-    Generate richer analyst-quality insights for a specific visualization.
-    This is called when user clicks "Generate deeper insights" — it returns
-    enhanced key_insights for each chart based on the actual computed data.
-    """
-    try:
-        req = request.json
-        dashboard = req.get("dashboard", {})
-        active_filters = req.get("active_filters", {})
-
-        if not dashboard:
-            return jsonify({"error": "No dashboard provided"}), 400
-
-        # Build a data-rich context for each visualization
-        viz_data_context = []
-        for viz in dashboard.get("visualizations", []):
-            fields = viz.get("fields", [])
-            hint = viz.get("data_hint", "")
-            computed = calculate_actual_data(viz["type"], fields, hint, active_filters)
-            if computed:
-                viz_data_context.append({
-                    "id": viz.get("id", ""),
-                    "title": viz.get("title", ""),
-                    "type": viz.get("type", ""),
-                    "actual_data": computed[:10]  # first 10 rows/entries
-                })
-
-        filter_desc = f"Active filters: {active_filters}" if active_filters else "No active filters — full dataset"
-        data_summary = get_data_summary()
-
-        prompt = f"""You are an expert HR data analyst. Based on the actual computed data below, 
-generate sharper, more specific key insights for each visualization.
-
-DATASET CONTEXT:
-{data_summary}
-
-{filter_desc}
-
-VISUALIZATIONS WITH ACTUAL DATA:
-{json.dumps(viz_data_context, indent=2)}
-
-CURRENT DASHBOARD TITLE: {dashboard.get("title", "")}
-
-For each visualization, return 2-3 insights that:
-1. Quote specific numbers directly from the actual_data provided
-2. Make an interpretation (not just describe — explain what it means for the business)
-3. Are concise — under 20 words each
-
-Respond ONLY with valid JSON, no markdown:
-{{
-  "enhanced_insights": {{
-    "<viz_id>": ["insight 1 with real number", "interpretation of why it matters", "optional third insight"],
-    ...
-  }},
-  "overall_insights": [
-    "5 updated overall insights based on actual data with real numbers"
-  ]
-}}"""
-
-        response = model.generate_content(
-            prompt,
-            generation_config={"max_output_tokens": 4096, "temperature": 0.2, "top_p": 0.9},
-        )
-
-        raw = response.text.strip()
-        for fence in ["```json", "```"]:
-            if fence in raw:
-                start = raw.find(fence) + len(fence)
-                end = raw.rfind("```")
-                raw = raw[start:end].strip()
-                break
-
-        parsed = json.loads(raw)
-
-        # Merge enhanced insights back into the dashboard visualizations
-        enhanced = parsed.get("enhanced_insights", {})
-        updated_vizs = []
-        for viz in dashboard.get("visualizations", []):
-            viz_id = viz.get("id", "")
-            if viz_id in enhanced:
-                viz = {**viz, "key_insights": enhanced[viz_id]}
-            updated_vizs.append(viz)
-
-        updated_dashboard = {
-            **dashboard,
-            "visualizations": updated_vizs,
-            "overall_insights": parsed.get("overall_insights", dashboard.get("overall_insights", [])),
-        }
-
-        return jsonify({
-            "dashboard": updated_dashboard,
-            "message": "Insights refreshed with actual data.",
-        })
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/schema", methods=["GET"])
-def get_schema():
-    """
-    Returns columns, row counts, and real distinct values for key categorical fields.
-    Used by the frontend to populate filter dropdowns with actual data values.
-    Always scoped to the latest snapshot so filter options match what users see.
-    """
-    df_raw = load_dataset()
-    if df_raw is None:
-        return jsonify({"columns": [], "sample": {}, "distinct_values": {}})
-
-    df, snapshot_label = get_latest_snapshot(df_raw)
-
-    # Key fields for filtering — return all distinct values (up to 50 per field)
-    filter_fields = [
-        "Active_Workforce_Status", "Current_Staffing_Status",
-        "Gender", "Age_Group", "Band", "Band_Level",
-        "Blue_White_Collar", "Worker_Category", "Contract_Type",
-        "Professional_Category", "Function", "Job_Family_Group",
-        "Job_Family", "Job_Category", "Direct_Indirect",
-        "Reporting_Region", "Company_Country", "Company_Name",
-        "Snapshot_Year", "Position_Worker_Type",
+def generate_fake_employees(count=75):
+    """Generate realistic employee data"""
+    
+    first_names = ["James", "Mary", "John", "Patricia", "Robert", "Jennifer", "Michael", "Linda",
+                   "William", "Elizabeth", "David", "Barbara", "Richard", "Susan", "Joseph", "Jessica",
+                   "Thomas", "Sarah", "Charles", "Karen", "Christopher", "Nancy", "Daniel", "Lisa",
+                   "Matthew", "Betty", "Anthony", "Margaret", "Mark", "Sandra", "Donald", "Ashley",
+                   "Steven", "Kimberly", "Paul", "Emily", "Andrew", "Donna", "Joshua", "Michelle"]
+    
+    last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis",
+                  "Rodriguez", "Martinez", "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas",
+                  "Taylor", "Moore", "Jackson", "Martin", "Lee", "Perez", "Thompson", "White"]
+    
+    work_locations = ["Herndon, VA", "Seattle, WA", "New York, NY", "Austin, TX", "Chicago, IL",
+                      "San Francisco, CA", "Boston, MA", "Denver, CO", "Atlanta, GA", "Remote - US"]
+    
+    supervisory_orgs = ["AAB", "XYZ", "DEF", "GHI", "JKL", "MNO", "PQR", "STU"]
+    
+    job_profiles = [
+        ("Software Engineer", "JP001", "J001"), ("Senior Software Engineer", "JP002", "J002"),
+        ("Data Analyst", "JP003", "J003"), ("Senior Data Analyst", "JP004", "J004"),
+        ("Product Manager", "JP005", "J005"), ("Senior Product Manager", "JP006", "J006"),
+        ("DevOps Engineer", "JP007", "J007"), ("UX Designer", "JP008", "J008"),
+        ("Data Scientist", "JP009", "J009"), ("Business Analyst", "JP010", "J010"),
+        ("Project Manager", "JP011", "J011"), ("QA Engineer", "JP012", "J012")
     ]
+    
+    bands = ["BI", "BII", "BIII", "BIV", "BV"]
+    
+    employees = []
+    
+    for i in range(count):
+        first_name = random.choice(first_names)
+        last_name = random.choice(last_names)
+        corporate_id = f"EMP{str(i+1000).zfill(5)}"
+        age = random.randint(22, 65)
+        year_of_birth = datetime.now().year - age
+        work_location = random.choice(work_locations)
+        siglum = random.choice(supervisory_orgs)
+        job_profile_name, job_profile_code, job_code = random.choice(job_profiles)
+        cost_center_code = f"CC{siglum[:2]}{random.randint(100, 999)}"
+        days_ago = random.randint(180, 7300)
+        hire_date = datetime.now() - timedelta(days=days_ago)
+        company_service_date = hire_date
+        tenure_years = days_ago / 365.25
+        
+        if "Senior" in job_profile_name or "Lead" in job_profile_name:
+            band = random.choice(["BIII", "BIV", "BV"])
+        else:
+            band = random.choice(["BI", "BII", "BIII"])
+        
+        if "Engineer" in job_profile_name or "DevOps" in job_profile_name:
+            department = "Engineering"
+        elif "Data" in job_profile_name:
+            department = "Data & Analytics"
+        elif "Product" in job_profile_name:
+            department = "Product Management"
+        elif "UX" in job_profile_name or "Designer" in job_profile_name:
+            department = "Design"
+        elif "QA" in job_profile_name:
+            department = "Quality Assurance"
+        else:
+            department = "Operations"
+        
+        if random.random() > 0.95:
+            employment_status = "Terminated"
+            termination_date = datetime.now() - timedelta(days=random.randint(1, 180))
+        else:
+            employment_status = "Active"
+            termination_date = None
+        
+        employees.append({
+            "Corporate_ID": corporate_id,
+            "First_Name": first_name,
+            "Last_Name": last_name,
+            "Full_Name": f"{first_name} {last_name}",
+            "Age": age,
+            "Year_of_Birth": year_of_birth,
+            "Work_Location": work_location,
+            "Supervisory_Organization_Siglum": siglum,
+            "Job_Profile_Name": job_profile_name,
+            "Job_Profile_Code": job_profile_code,
+            "Cost_Center_Code": cost_center_code,
+            "Job_Code": job_code,
+            "Position_Title": job_profile_name,
+            "Hire_Date": hire_date.strftime("%Y-%m-%d"),
+            "Company_Service_Date": company_service_date.strftime("%Y-%m-%d"),
+            "Band": band,
+            "Department": department,
+            "Employment_Status": employment_status,
+            "Termination_Date": termination_date.strftime("%Y-%m-%d") if termination_date else None,
+            "Tenure_Years": round(tenure_years, 1)
+        })
+    
+    return pd.DataFrame(employees)
 
-    distinct_values = {}
-    for col in filter_fields:
-        if col in df.columns:
-            vals = df[col].dropna().unique().tolist()
-            distinct_values[col] = sorted([str(v) for v in vals])[:50]
 
-    # Small sample for all columns (for schema browsing)
-    sample = {}
-    for col in df.columns[:30]:
-        sample[col] = [str(v) for v in df[col].dropna().unique()[:3].tolist()]
+def generate_fake_time_tracking(employees_df, days=90):
+    """Generate realistic time tracking data"""
+    
+    work_types = ["Project Work", "Meetings", "Training", "Administrative", 
+                  "Code Review", "Documentation", "Client Communication"]
+    
+    project_codes = ["PRJ001-Alpha", "PRJ002-Beta", "PRJ003-Gamma", "PRJ004-Delta",
+                     "PRJ005-Epsilon", "INT-001-Infrastructure", "MAINT-Support"]
+    
+    time_entries = []
+    base_date = datetime.now() - timedelta(days=days)
+    
+    active_employees = employees_df[employees_df['Employment_Status'] == 'Active']
+    
+    for _, employee in active_employees.iterrows():
+        corporate_id = employee['Corporate_ID']
+        
+        for day in range(days):
+            current_date = base_date + timedelta(days=day)
+            
+            if current_date.weekday() >= 5:
+                continue
+            
+            if random.random() > 0.9:
+                continue
+            
+            num_entries = random.randint(1, 4)
+            daily_hours = random.uniform(7.5, 9.5)
+            
+            for entry in range(num_entries):
+                work_type = random.choice(work_types)
+                project_code = random.choice(project_codes)
+                
+                if entry == num_entries - 1:
+                    hours = daily_hours
+                else:
+                    hours = random.uniform(1, daily_hours * 0.4)
+                    daily_hours -= hours
+                
+                hours = round(hours, 2)
+                
+                time_entries.append({
+                    "Corporate_ID": corporate_id,
+                    "Entry_Date": current_date.strftime("%Y-%m-%d"),
+                    "Hours": hours,
+                    "Work_Type": work_type,
+                    "Project_Code": project_code,
+                    "Week_Number": current_date.isocalendar()[1],
+                    "Month": current_date.strftime("%Y-%m"),
+                    "Quarter": f"Q{(current_date.month-1)//3 + 1} {current_date.year}"
+                })
+    
+    return pd.DataFrame(time_entries)
 
-    id_col = next((c for c in ["Corporate_ID", "Nominative_List_Unique_ID"] if c in df.columns), None)
-    distinct_employees = int(df[id_col].nunique()) if id_col else len(df)
 
-    return jsonify({
-        "columns": list(df.columns),
-        "total_rows": len(df_raw),
-        "snapshot_rows": len(df),
-        "distinct_employees": distinct_employees,
-        "snapshot_label": snapshot_label,
-        "sample": sample,
-        "distinct_values": distinct_values,
-    })
+_cached_employees = None
+_cached_time_tracking = None
+
+def get_sample_employees():
+    global _cached_employees
+    if _cached_employees is None:
+        _cached_employees = generate_fake_employees(count=75)
+    return _cached_employees.copy()
+
+def get_sample_time_tracking():
+    global _cached_time_tracking
+    if _cached_time_tracking is None:
+        employees_df = get_sample_employees()
+        _cached_time_tracking = generate_fake_time_tracking(employees_df, days=90)
+    return _cached_time_tracking.copy()
+
+# ============================================================================
+# MINIMAL LANDING PAGE - Claude/OpenAI Style
+# ============================================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    """Clean, minimal landing page"""
+    
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Dashboard AI Agent</title>
+        <script src="https://cdn.plot.ly/plotly-2.27.0.min.js" charset="utf-8"></script>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+                background: linear-gradient(135deg, #0a1628 0%, #1a2942 50%, #0f1923 100%);
+                min-height: 100vh;
+                color: #e8eaed;
+                display: flex;
+                flex-direction: column;
+            }
+            
+            /* Header */
+            .header {
+                padding: 20px 40px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+                background: rgba(10, 22, 40, 0.6);
+                backdrop-filter: blur(10px);
+            }
+            
+            .logo {
+                font-size: 20px;
+                font-weight: 600;
+                color: #e8eaed;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            
+            .logo-icon {
+                width: 28px;
+                height: 28px;
+                background: linear-gradient(135deg, #4a9eff 0%, #2563eb 100%);
+                border-radius: 6px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 16px;
+            }
+            
+            /* Main Container */
+            .main-container {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                max-width: 1400px;
+                width: 100%;
+                margin: 0 auto;
+                padding: 20px;
+            }
+            
+            /* Welcome Section - Only shows initially */
+            .welcome-section {
+                flex: 1;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                text-align: center;
+                padding: 60px 20px;
+                transition: all 0.5s ease;
+            }
+            
+            .welcome-section.hidden {
+                display: none;
+            }
+            
+            .welcome-title {
+                font-size: 48px;
+                font-weight: 300;
+                margin-bottom: 20px;
+                background: linear-gradient(135deg, #e8eaed 0%, #9ca3af 100%);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }
+            
+            .welcome-subtitle {
+                font-size: 18px;
+                color: #9ca3af;
+                margin-bottom: 50px;
+                max-width: 600px;
+            }
+            
+            .example-prompts {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                gap: 16px;
+                max-width: 900px;
+                width: 100%;
+                margin-bottom: 40px;
+            }
+            
+            .example-card {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 12px;
+                padding: 20px;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                text-align: left;
+            }
+            
+            .example-card:hover {
+                background: rgba(255, 255, 255, 0.08);
+                border-color: rgba(74, 158, 255, 0.5);
+                transform: translateY(-2px);
+            }
+            
+            .example-icon {
+                font-size: 24px;
+                margin-bottom: 12px;
+            }
+            
+            .example-title {
+                font-size: 15px;
+                font-weight: 500;
+                color: #e8eaed;
+                margin-bottom: 6px;
+            }
+            
+            .example-desc {
+                font-size: 13px;
+                color: #9ca3af;
+            }
+            
+            /* Input Section - Fixed at bottom */
+            .input-section {
+                position: sticky;
+                bottom: 0;
+                background: rgba(10, 22, 40, 0.95);
+                backdrop-filter: blur(10px);
+                border-top: 1px solid rgba(255, 255, 255, 0.08);
+                padding: 20px;
+                z-index: 100;
+            }
+            
+            .input-wrapper {
+                max-width: 900px;
+                margin: 0 auto;
+                position: relative;
+            }
+            
+            .input-box {
+                width: 100%;
+                background: rgba(255, 255, 255, 0.08);
+                border: 2px solid rgba(255, 255, 255, 0.12);
+                border-radius: 14px;
+                padding: 16px 60px 16px 20px;
+                font-size: 15px;
+                color: #e8eaed;
+                transition: all 0.3s ease;
+                resize: none;
+                font-family: inherit;
+                line-height: 1.5;
+            }
+            
+            .input-box:focus {
+                outline: none;
+                border-color: #4a9eff;
+                background: rgba(255, 255, 255, 0.1);
+            }
+            
+            .input-box::placeholder {
+                color: #6b7280;
+            }
+            
+            .send-button {
+                position: absolute;
+                right: 8px;
+                bottom: 8px;
+                width: 40px;
+                height: 40px;
+                background: linear-gradient(135deg, #4a9eff 0%, #2563eb 100%);
+                border: none;
+                border-radius: 10px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                transition: all 0.3s ease;
+                font-size: 18px;
+            }
+            
+            .send-button:hover {
+                transform: scale(1.05);
+                box-shadow: 0 4px 20px rgba(74, 158, 255, 0.4);
+            }
+            
+            .send-button:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
+            
+            /* Dashboard Container */
+            .dashboard-container {
+                flex: 1;
+                padding: 30px 20px;
+                overflow-y: auto;
+                display: none;
+            }
+            
+            .dashboard-container.active {
+                display: block;
+            }
+            
+            /* Loading State */
+            .loading-state {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 80px 20px;
+            }
+            
+            .spinner {
+                width: 50px;
+                height: 50px;
+                border: 3px solid rgba(255, 255, 255, 0.1);
+                border-top-color: #4a9eff;
+                border-radius: 50%;
+                animation: spin 0.8s linear infinite;
+            }
+            
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+            
+            .loading-text {
+                margin-top: 20px;
+                color: #9ca3af;
+                font-size: 15px;
+            }
+            
+            /* Dashboard Header */
+            .dashboard-header {
+                margin-bottom: 30px;
+                padding-bottom: 20px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            }
+            
+            .dashboard-title {
+                font-size: 28px;
+                font-weight: 500;
+                color: #e8eaed;
+                margin-bottom: 8px;
+            }
+            
+            .dashboard-subtitle {
+                font-size: 14px;
+                color: #9ca3af;
+            }
+            
+            /* KPI Cards */
+            .kpi-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }
+            
+            .kpi-card {
+                background: linear-gradient(135deg, rgba(74, 158, 255, 0.12) 0%, rgba(37, 99, 235, 0.08) 100%);
+                border: 1px solid rgba(74, 158, 255, 0.2);
+                border-radius: 12px;
+                padding: 24px;
+                transition: all 0.3s ease;
+            }
+            
+            .kpi-card:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 8px 30px rgba(74, 158, 255, 0.15);
+            }
+            
+            .kpi-value {
+                font-size: 36px;
+                font-weight: 600;
+                color: #e8eaed;
+                margin-bottom: 8px;
+            }
+            
+            .kpi-label {
+                font-size: 13px;
+                color: #9ca3af;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+            
+            /* Chart Grid */
+            .chart-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+                gap: 24px;
+                margin-bottom: 30px;
+            }
+            
+            .chart-container {
+                background: rgba(255, 255, 255, 0.03);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 16px;
+                padding: 20px;
+                transition: all 0.3s ease;
+                min-height: 400px;
+            }
+            
+            .chart-container:hover {
+                border-color: rgba(255, 255, 255, 0.15);
+            }
+            
+            /* Plotly chart styling */
+            .js-plotly-plot, .plotly {
+                width: 100% !important;
+                height: 100% !important;
+            }
+            
+            .plotly .svg-container {
+                width: 100% !important;
+                height: 100% !important;
+            }
+            
+            /* Error State */
+            .error-message {
+                background: rgba(239, 68, 68, 0.1);
+                border: 1px solid rgba(239, 68, 68, 0.3);
+                color: #fca5a5;
+                padding: 20px;
+                border-radius: 12px;
+                margin: 20px;
+                text-align: center;
+            }
+            
+            /* Responsive */
+            @media (max-width: 768px) {
+                .welcome-title { font-size: 32px; }
+                .example-prompts { grid-template-columns: 1fr; }
+                .chart-grid { grid-template-columns: 1fr; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="logo">
+                Dashboard AI
+            </div>
+        </div>
+        
+        <div class="main-container">
+            <!-- Welcome Section -->
+            <div class="welcome-section" id="welcomeSection">
+                <h1 class="welcome-title">Generate insights instantly</h1>
+                <p class="welcome-subtitle">
+                    Ask questions about your employee data and get professional dashboards with AI-powered analytics
+                </p>
+                
+                <div class="example-prompts">
+                    <div class="example-card" onclick="setQuery('Show me attrition dashboard for this quarter')">
+                        <div class="example-icon">📉</div>
+                        <div class="example-title">Attrition Analysis</div>
+                        <div class="example-desc">Analyze employee turnover trends and retention metrics</div>
+                    </div>
+                    
+                    <div class="example-card" onclick="setQuery('Hours worked by department this month')">
+                        <div class="example-icon">⏱️</div>
+                        <div class="example-title">Time Tracking</div>
+                        <div class="example-desc">View work hours distribution across teams and projects</div>
+                    </div>
+                    
+                    <div class="example-card" onclick="setQuery('Compare Herndon vs Seattle locations')">
+                        <div class="example-icon">🗺️</div>
+                        <div class="example-title">Location Insights</div>
+                        <div class="example-desc">Compare metrics between different office locations</div>
+                    </div>
+                    
+                    <div class="example-card" onclick="setQuery('Show band distribution by department')">
+                        <div class="example-icon">🎯</div>
+                        <div class="example-title">Band Analysis</div>
+                        <div class="example-desc">Examine employee levels and career progression</div>
+                    </div>
+                    
+                    <div class="example-card" onclick="setQuery('Department demographics breakdown')">
+                        <div class="example-icon">👥</div>
+                        <div class="example-title">Demographics</div>
+                        <div class="example-desc">Understand team composition and diversity metrics</div>
+                    </div>
+                    
+                    <div class="example-card" onclick="setQuery('Project allocation overview')">
+                        <div class="example-icon">📋</div>
+                        <div class="example-title">Project Insights</div>
+                        <div class="example-desc">See how resources are distributed across projects</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Dashboard Container -->
+            <div class="dashboard-container" id="dashboardContainer"></div>
+        </div>
+        
+        <!-- Input Section -->
+        <div class="input-section">
+            <div class="input-wrapper">
+                <textarea 
+                    id="queryInput" 
+                    class="input-box" 
+                    placeholder="Ask anything about your employee data..."
+                    rows="1"
+                ></textarea>
+                <button class="send-button" id="sendButton" onclick="generateDashboard()">
+                    ➤
+                </button>
+            </div>
+        </div>
+
+        <script>
+            const queryInput = document.getElementById('queryInput');
+            const sendButton = document.getElementById('sendButton');
+            const welcomeSection = document.getElementById('welcomeSection');
+            const dashboardContainer = document.getElementById('dashboardContainer');
+            
+            // Auto-resize textarea
+            queryInput.addEventListener('input', function() {
+                this.style.height = 'auto';
+                this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+            });
+            
+            // Enter to submit (Shift+Enter for new line)
+            queryInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    generateDashboard();
+                }
+            });
+            
+            function setQuery(text) {
+                queryInput.value = text;
+                queryInput.focus();
+                generateDashboard();
+            }
+            
+            async function generateDashboard() {
+                const query = queryInput.value.trim();
+                if (!query) return;
+                
+                // Hide welcome, show dashboard container
+                welcomeSection.classList.add('hidden');
+                dashboardContainer.classList.add('active');
+                
+                // Show loading
+                dashboardContainer.innerHTML = `
+                    <div class="loading-state">
+                        <div class="spinner"></div>
+                        <div class="loading-text">Analyzing your query and generating dashboard...</div>
+                    </div>
+                `;
+                
+                sendButton.disabled = true;
+                
+                try {
+                    const response = await fetch('/generate-dashboard', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query: query })
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        dashboardContainer.innerHTML = `
+                            <div class="error-message">
+                                <strong>Error:</strong> ${data.error}
+                            </div>
+                        `;
+                    } else {
+                        dashboardContainer.innerHTML = data.html;
+                        
+                        // Force Plotly to resize after rendering
+                        setTimeout(() => {
+                            const plots = document.querySelectorAll('.js-plotly-plot');
+                            plots.forEach(plot => {
+                                if (window.Plotly) {
+                                    window.Plotly.Plots.resize(plot);
+                                }
+                            });
+                        }, 100);
+                    }
+                } catch (error) {
+                    dashboardContainer.innerHTML = `
+                        <div class="error-message">
+                            <strong>Error:</strong> ${error.message}
+                        </div>
+                    `;
+                } finally {
+                    sendButton.disabled = false;
+                    queryInput.value = '';
+                    queryInput.style.height = 'auto';
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False)
+@app.post("/generate-dashboard")
+async def generate_dashboard(request: Request):
+    """Generate professional dashboard with high-quality visualizations"""
+    try:
+        body = await request.json()
+        user_query = body.get("query", "")
+        
+        parsed_query = await parse_query_with_ai(user_query)
+        
+        employees_df = get_sample_employees()
+        time_df = get_sample_time_tracking()
+        
+        filtered_data = filter_data(parsed_query, employees_df, time_df)
+        
+        dashboard_html = generate_dashboard_html(parsed_query, filtered_data)
+        
+        return JSONResponse(content={
+            "success": True,
+            "html": dashboard_html,
+            "query_interpretation": parsed_query
+        })
+        
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"Error: {error_detail}")
+        return JSONResponse(content={
+            "error": f"{str(e)}"
+        }, status_code=500)
+
+
+async def parse_query_with_ai(user_query: str) -> dict:
+    """Parse query with AI or fallback"""
+    
+    if VERTEX_AI_ENABLED:
+        try:
+            model = GenerativeModel("gemini-1.5-pro-001")
+            
+            prompt = f"""Parse this employee data query into JSON format.
+
+Query: "{user_query}"
+
+Available data: Corporate_ID, Name, Age, Work_Location, Supervisory_Organization_Siglum, 
+Job_Profile_Name, Position_Title, Band (BI/BII/BIII/BIV/BV), Department, Hire_Date, Tenure_Years, 
+Employment_Status, Time Tracking (Hours, Work_Type, Project_Code, Entry_Date, Quarter, Month)
+
+Return ONLY JSON (no markdown):
+{{
+    "dashboard_type": "attrition" | "hours" | "demographics" | "band_analysis" | "location_compare" | "project" | "general",
+    "filters": {{}},
+    "focus": "description",
+    "time_period": "this quarter" | "this month" | "last 90 days" | null
+}}"""
+            
+            response = model.generate_content(prompt)
+            result_text = response.text.strip()
+            
+            if result_text.startswith("```"):
+                result_text = result_text.split("```")[1]
+                if result_text.startswith("json"):
+                    result_text = result_text[4:]
+            
+            return json.loads(result_text.strip())
+        except Exception as e:
+            print(f"Vertex AI error: {e}")
+    
+    return fallback_query_parser(user_query)
+
+
+def fallback_query_parser(user_query: str) -> dict:
+    """Enhanced fallback parser"""
+    
+    query_lower = user_query.lower()
+    
+    # Time period detection
+    time_period = None
+    if "quarter" in query_lower:
+        time_period = "this quarter"
+    elif "month" in query_lower:
+        time_period = "this month"
+    
+    # Dashboard type detection
+    if any(word in query_lower for word in ["attrition", "turnover", "retention", "tenure"]):
+        return {"dashboard_type": "attrition", "filters": {}, "focus": "employee attrition analysis", "time_period": time_period}
+    elif any(word in query_lower for word in ["hours", "time", "tracking"]):
+        return {"dashboard_type": "hours", "filters": {}, "focus": "time tracking analysis", "time_period": time_period}
+    elif any(word in query_lower for word in ["band", "level"]):
+        return {"dashboard_type": "band_analysis", "filters": {}, "focus": "band distribution", "time_period": time_period}
+    elif any(word in query_lower for word in ["demographic", "age"]):
+        return {"dashboard_type": "demographics", "filters": {}, "focus": "employee demographics", "time_period": time_period}
+    elif any(word in query_lower for word in ["compare", "vs", "versus"]):
+        return {"dashboard_type": "location_compare", "filters": {}, "focus": "location comparison", "time_period": time_period}
+    elif any(word in query_lower for word in ["project", "allocation"]):
+        return {"dashboard_type": "project", "filters": {}, "focus": "project allocation", "time_period": time_period}
+    else:
+        return {"dashboard_type": "general", "filters": {}, "focus": "general overview", "time_period": time_period}
+
+
+def filter_data(parsed_query: dict, employees_df: pd.DataFrame, time_df: pd.DataFrame) -> dict:
+    """Filter data based on query and time period"""
+    
+    filters = parsed_query.get("filters", {})
+    time_period = parsed_query.get("time_period")
+    
+    filtered_employees = employees_df.copy()
+    
+    for key, value in filters.items():
+        if key in filtered_employees.columns:
+            filtered_employees = filtered_employees[filtered_employees[key] == value]
+    
+    corporate_ids = filtered_employees['Corporate_ID'].tolist()
+    filtered_time = time_df[time_df['Corporate_ID'].isin(corporate_ids)]
+    
+    # Apply time period filter
+    if time_period and not filtered_time.empty:
+        filtered_time['Entry_Date'] = pd.to_datetime(filtered_time['Entry_Date'])
+        now = datetime.now()
+        
+        if time_period == "this quarter":
+            current_quarter = (now.month - 1) // 3 + 1
+            current_year = now.year
+            filtered_time = filtered_time[filtered_time['Quarter'] == f"Q{current_quarter} {current_year}"]
+        elif time_period == "this month":
+            current_month = now.strftime("%Y-%m")
+            filtered_time = filtered_time[filtered_time['Month'] == current_month]
+    
+    return {
+        "employees": filtered_employees,
+        "time_tracking": filtered_time
+    }
+
+
+def generate_dashboard_html(parsed_query: dict, data: dict) -> str:
+    """Generate professional dashboard with high-quality visualizations"""
+    
+    dashboard_type = parsed_query.get("dashboard_type", "general")
+    employees_df = data["employees"]
+    time_df = data["time_tracking"]
+    time_period = parsed_query.get("time_period", "")
+    
+    if employees_df.empty:
+        return """
+        <div style="text-align: center; padding: 80px 20px; color: #9ca3af;">
+            <div style="font-size: 48px; margin-bottom: 20px;">📭</div>
+            <h2 style="color: #e8eaed; margin-bottom: 12px; font-size: 24px;">No Data Found</h2>
+            <p>Try adjusting your query or check your filters</p>
+        </div>
+        """
+    
+    active_employees = employees_df[employees_df['Employment_Status'] == 'Active']
+    
+    # Color scheme - Professional and modern
+    COLOR_SCHEME = ['#4a9eff', '#2563eb', '#1e40af', '#1e3a8a', '#6366f1', '#4f46e5']
+    BG_COLOR = 'rgba(10, 22, 40, 0)'
+    PAPER_COLOR = 'rgba(255, 255, 255, 0.02)'
+    GRID_COLOR = 'rgba(255, 255, 255, 0.05)'
+    TEXT_COLOR = '#9ca3af'
+    TITLE_COLOR = '#e8eaed'
+    
+    figures = []
+    
+    # Generate smart KPIs based on dashboard type
+    def generate_smart_kpis():
+        kpis = []
+        
+        if dashboard_type == "attrition":
+            terminated = len(employees_df[employees_df['Employment_Status'] == 'Terminated'])
+            total = len(employees_df)
+            attrition_rate = (terminated / total * 100) if total > 0 else 0
+            avg_tenure = active_employees['Tenure_Years'].mean() if not active_employees.empty else 0
+            
+            # Attrition by recent quarter
+            if not time_df.empty and time_period:
+                period_label = time_period.title()
+            else:
+                period_label = "Overall"
+            
+            kpis = [
+                {"value": len(active_employees), "label": "Active Employees"},
+                {"value": terminated, "label": "Terminated"},
+                {"value": f"{attrition_rate:.1f}%", "label": "Attrition Rate"},
+                {"value": f"{avg_tenure:.1f}yr", "label": "Avg Tenure"}
+            ]
+        
+        elif dashboard_type == "hours":
+            if not time_df.empty:
+                total_hours = time_df['Hours'].sum()
+                avg_daily = time_df.groupby('Entry_Date')['Hours'].sum().mean()
+                top_work_type = time_df.groupby('Work_Type')['Hours'].sum().idxmax()
+                active_projects = time_df['Project_Code'].nunique()
+                
+                period_label = time_period.title() if time_period else "Last 90 Days"
+                
+                kpis = [
+                    {"value": f"{int(total_hours):,}h", "label": f"Total Hours ({period_label})"},
+                    {"value": f"{avg_daily:.1f}h", "label": "Avg Daily Hours"},
+                    {"value": top_work_type.split()[0], "label": "Top Activity"},
+                    {"value": active_projects, "label": "Active Projects"}
+                ]
+            else:
+                kpis = [
+                    {"value": "N/A", "label": "No Time Data"},
+                    {"value": "N/A", "label": "Available"},
+                    {"value": "N/A", "label": "For This"},
+                    {"value": "N/A", "label": "Period"}
+                ]
+        
+        elif dashboard_type == "band_analysis":
+            band_counts = active_employees['Band'].value_counts()
+            most_common = band_counts.idxmax() if not band_counts.empty else "N/A"
+            senior_count = len(active_employees[active_employees['Band'].isin(['BIV', 'BV'])])
+            
+            kpis = [
+                {"value": len(active_employees), "label": "Total Employees"},
+                {"value": most_common, "label": "Most Common Band"},
+                {"value": senior_count, "label": "Senior Level (IV-V)"},
+                {"value": active_employees['Band'].nunique(), "label": "Band Levels"}
+            ]
+        
+        elif dashboard_type == "demographics":
+            avg_age = active_employees['Age'].mean()
+            age_range = f"{active_employees['Age'].min()}-{active_employees['Age'].max()}"
+            
+            kpis = [
+                {"value": len(active_employees), "label": "Active Employees"},
+                {"value": f"{avg_age:.0f}", "label": "Average Age"},
+                {"value": age_range, "label": "Age Range"},
+                {"value": active_employees['Department'].nunique(), "label": "Departments"}
+            ]
+        
+        elif dashboard_type == "location_compare":
+            locations = active_employees['Work_Location'].nunique()
+            top_location = active_employees['Work_Location'].value_counts().idxmax()
+            
+            kpis = [
+                {"value": len(active_employees), "label": "Total Employees"},
+                {"value": locations, "label": "Locations"},
+                {"value": top_location.split(',')[0], "label": "Largest Office"},
+                {"value": f"{active_employees['Tenure_Years'].mean():.1f}yr", "label": "Avg Tenure"}
+            ]
+        
+        elif dashboard_type == "project":
+            if not time_df.empty:
+                projects = time_df['Project_Code'].nunique()
+                top_project = time_df.groupby('Project_Code')['Hours'].sum().idxmax()
+                
+                kpis = [
+                    {"value": projects, "label": "Active Projects"},
+                    {"value": top_project.split('-')[0], "label": "Top Project"},
+                    {"value": f"{time_df['Hours'].sum():,.0f}h", "label": "Total Hours"},
+                    {"value": len(active_employees), "label": "Team Members"}
+                ]
+            else:
+                kpis = [{"value": "N/A", "label": "No Project Data"} for _ in range(4)]
+        
+        else:  # general
+            kpis = [
+                {"value": len(active_employees), "label": "Active Employees"},
+                {"value": active_employees['Work_Location'].nunique(), "label": "Locations"},
+                {"value": active_employees['Department'].nunique(), "label": "Departments"},
+                {"value": f"{active_employees['Tenure_Years'].mean():.1f}yr", "label": "Avg Tenure"}
+            ]
+        
+        # Generate KPI HTML
+        kpi_html = '<div class="kpi-grid">'
+        for kpi in kpis:
+            kpi_html += f'''
+            <div class="kpi-card">
+                <div class="kpi-value">{kpi["value"]}</div>
+                <div class="kpi-label">{kpi["label"]}</div>
+            </div>
+            '''
+        kpi_html += '</div>'
+        return kpi_html
+    
+    kpi_html = generate_smart_kpis()
+    
+    # Build visualizations based on dashboard type
+    plotly_config = {'displayModeBar': False, 'responsive': True}
+    
+    def create_figure_layout(title):
+        return dict(
+            title=dict(text=title, font=dict(color=TITLE_COLOR, size=18, family='Inter'), x=0.05),
+            paper_bgcolor=PAPER_COLOR,
+            plot_bgcolor=BG_COLOR,
+            font=dict(color=TEXT_COLOR, family='Inter'),
+            margin=dict(l=50, r=30, t=50, b=50),
+            height=400,
+            xaxis=dict(gridcolor=GRID_COLOR, color=TEXT_COLOR, showgrid=True),
+            yaxis=dict(gridcolor=GRID_COLOR, color=TEXT_COLOR, showgrid=True),
+            hovermode='closest'
+        )
+    
+    if dashboard_type == "attrition":
+        # Chart 1: Turnover by Department
+        dept_status = employees_df.groupby(['Department', 'Employment_Status']).size().unstack(fill_value=0)
+        
+        fig1 = go.Figure()
+        fig1.add_trace(go.Bar(
+            name='Active',
+            x=dept_status.index,
+            y=dept_status['Active'] if 'Active' in dept_status.columns else [],
+            marker_color='#4a9eff',
+            text=dept_status['Active'] if 'Active' in dept_status.columns else [],
+            textposition='inside',
+            textfont=dict(color='white', size=12)
+        ))
+        if 'Terminated' in dept_status.columns:
+            fig1.add_trace(go.Bar(
+                name='Terminated',
+                x=dept_status.index,
+                y=dept_status['Terminated'],
+                marker_color='#ef4444',
+                text=dept_status['Terminated'],
+                textposition='inside',
+                textfont=dict(color='white', size=12)
+            ))
+        
+        fig1.update_layout(
+            **create_figure_layout('Employee Status by Department'),
+            barmode='stack',
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(color=TEXT_COLOR))
+        )
+        figures.append(f'<div class="chart-container">{fig1.to_html(full_html=False, include_plotlyjs="cdn", config=plotly_config, div_id="chart1")}</div>')
+        
+        # Chart 2: Tenure Distribution
+        fig2 = go.Figure()
+        fig2.add_trace(go.Histogram(
+            x=active_employees['Tenure_Years'],
+            nbinsx=20,
+            marker=dict(
+                color='#4a9eff',
+                line=dict(color='#2563eb', width=1)
+            ),
+            hovertemplate='Tenure: %{x:.1f} years<br>Count: %{y}<extra></extra>'
+        ))
+        
+        fig2.update_layout(
+            **create_figure_layout('Tenure Distribution'),
+            xaxis_title='Years of Service',
+            yaxis_title='Number of Employees'
+        )
+        figures.append(fig2.to_html(full_html=False, include_plotlyjs=False, config=plotly_config))
+        
+        # Chart 3: Location-wise Retention
+        location_counts = active_employees['Work_Location'].value_counts().head(8).sort_values()
+        
+        fig3 = go.Figure()
+        fig3.add_trace(go.Bar(
+            y=location_counts.index,
+            x=location_counts.values,
+            orientation='h',
+            marker=dict(
+                color='#4a9eff',
+                line=dict(color='#2563eb', width=1)
+            ),
+            text=location_counts.values,
+            textposition='auto',
+            textfont=dict(color='white', size=12),
+            hovertemplate='%{y}<br>Employees: %{x}<extra></extra>'
+        ))
+        
+        layout3 = create_figure_layout('Active Employees by Location')
+        layout3['xaxis_title'] = 'Number of Employees'
+        layout3['yaxis'] = dict(color=TEXT_COLOR, showgrid=False)
+        fig3.update_layout(**layout3)
+        figures.append(f'<div class="chart-container">{fig3.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart3")}</div>')
+        
+    elif dashboard_type == "hours":
+        if not time_df.empty:
+            # Map departments
+            emp_dept_map = employees_df.set_index('Corporate_ID')['Department'].to_dict()
+            time_df['Department'] = time_df['Corporate_ID'].map(emp_dept_map)
+            
+            # Chart 1: Hours by Department
+            hours_by_dept = time_df.groupby('Department')['Hours'].sum().sort_values(ascending=False)
+            
+            fig1 = go.Figure()
+            fig1.add_trace(go.Bar(
+                x=hours_by_dept.index,
+                y=hours_by_dept.values,
+                marker=dict(
+                    color=COLOR_SCHEME[:len(hours_by_dept)],
+                    line=dict(color='#1e3a8a', width=1)
+                ),
+                text=[f'{int(v):,}h' for v in hours_by_dept.values],
+                textposition='outside',
+                textfont=dict(color=TEXT_COLOR, size=11),
+                hovertemplate='%{x}<br>Hours: %{y:,.0f}<extra></extra>'
+            ))
+            
+            period_text = f" ({time_period.title()})" if time_period else " (Last 90 Days)"
+            fig1.update_layout(**create_figure_layout(f'Total Hours by Department{period_text}'))
+            figures.append(f'<div class="chart-container">{fig1.to_html(full_html=False, include_plotlyjs="cdn", config=plotly_config, div_id="chart1")}</div>')
+            
+            # Chart 2: Work Type Breakdown
+            hours_by_type = time_df.groupby('Work_Type')['Hours'].sum().sort_values(ascending=False)
+            
+            fig2 = go.Figure()
+            fig2.add_trace(go.Pie(
+                labels=hours_by_type.index,
+                values=hours_by_type.values,
+                hole=0.45,
+                marker=dict(colors=COLOR_SCHEME, line=dict(color='#0a1628', width=2)),
+                textfont=dict(color='white', size=12),
+                hovertemplate='%{label}<br>%{value:,.0f} hours (%{percent})<extra></extra>'
+            ))
+            
+            layout2 = create_figure_layout('Hours by Work Type')
+            layout2['showlegend'] = True
+            layout2['legend'] = dict(orientation='v', yanchor='middle', y=0.5, xanchor='left', x=1.05, font=dict(color=TEXT_COLOR))
+            fig2.update_layout(**layout2)
+            figures.append(f'<div class="chart-container">{fig2.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart2")}</div>')
+            
+            # Chart 3: Daily Trend
+            time_df['Entry_Date'] = pd.to_datetime(time_df['Entry_Date'])
+            daily_hours = time_df.groupby('Entry_Date')['Hours'].sum().reset_index()
+            
+            # Calculate 7-day moving average
+            daily_hours['MA7'] = daily_hours['Hours'].rolling(window=7, min_periods=1).mean()
+            
+            fig3 = go.Figure()
+            fig3.add_trace(go.Scatter(
+                x=daily_hours['Entry_Date'],
+                y=daily_hours['Hours'],
+                mode='lines',
+                name='Daily Hours',
+                line=dict(color='#4a9eff', width=1),
+                fill='tozeroy',
+                fillcolor='rgba(74, 158, 255, 0.2)',
+                hovertemplate='%{x|%b %d}<br>Hours: %{y:.1f}<extra></extra>'
+            ))
+            fig3.add_trace(go.Scatter(
+                x=daily_hours['Entry_Date'],
+                y=daily_hours['MA7'],
+                mode='lines',
+                name='7-Day Average',
+                line=dict(color='#fbbf24', width=2, dash='dash'),
+                hovertemplate='%{x|%b %d}<br>Avg: %{y:.1f}<extra></extra>'
+            ))
+            
+            layout3 = create_figure_layout('Daily Hours Trend')
+            layout3['showlegend'] = True
+            layout3['legend'] = dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(color=TEXT_COLOR))
+            layout3['xaxis_title'] = 'Date'
+            layout3['yaxis_title'] = 'Hours'
+            fig3.update_layout(**layout3)
+            figures.append(f'<div class="chart-container">{fig3.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart3")}</div>')
+            
+            # Chart 4: Top Projects
+            project_hours = time_df.groupby('Project_Code')['Hours'].sum().sort_values(ascending=True).tail(10)
+            
+            fig4 = go.Figure()
+            fig4.add_trace(go.Bar(
+                y=project_hours.index,
+                x=project_hours.values,
+                orientation='h',
+                marker=dict(
+                    color='#6366f1',
+                    line=dict(color='#4f46e5', width=1)
+                ),
+                text=[f'{int(v):,}h' for v in project_hours.values],
+                textposition='auto',
+                textfont=dict(color='white', size=10),
+                hovertemplate='%{y}<br>Hours: %{x:,.0f}<extra></extra>'
+            ))
+            
+            layout4 = create_figure_layout('Top 10 Projects by Hours')
+            layout4['yaxis'] = dict(color=TEXT_COLOR, showgrid=False)
+            layout4['xaxis_title'] = 'Total Hours'
+            fig4.update_layout(**layout4)
+            figures.append(f'<div class="chart-container">{fig4.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart4")}</div>')
+    
+    elif dashboard_type == "band_analysis":
+        # Chart 1: Band Distribution
+        band_order = ['BI', 'BII', 'BIII', 'BIV', 'BV']
+        band_counts = active_employees['Band'].value_counts().reindex(band_order, fill_value=0)
+        
+        fig1 = go.Figure()
+        fig1.add_trace(go.Bar(
+            x=band_counts.index,
+            y=band_counts.values,
+            marker=dict(
+                color=COLOR_SCHEME[:len(band_counts)],
+                line=dict(color='#1e3a8a', width=1)
+            ),
+            text=band_counts.values,
+            textposition='outside',
+            textfont=dict(color=TEXT_COLOR, size=14, weight='bold'),
+            hovertemplate='Band %{x}<br>Employees: %{y}<extra></extra>'
+        ))
+        
+        fig1.update_layout(
+            **create_figure_layout('Employee Distribution by Band'),
+            xaxis_title='Band Level',
+            yaxis_title='Number of Employees'
+        )
+        figures.append(f'<div class="chart-container">{fig1.to_html(full_html=False, include_plotlyjs="cdn", config=plotly_config, div_id="chart1")}</div>')
+        
+        # Chart 2: Band by Department (Stacked)
+        band_dept = active_employees.groupby(['Department', 'Band']).size().unstack(fill_value=0)
+        
+        fig2 = go.Figure()
+        for i, band in enumerate(band_order):
+            if band in band_dept.columns:
+                fig2.add_trace(go.Bar(
+                    name=band,
+                    x=band_dept.index,
+                    y=band_dept[band],
+                    marker_color=COLOR_SCHEME[i % len(COLOR_SCHEME)],
+                    text=band_dept[band],
+                    textposition='inside',
+                    textfont=dict(color='white', size=10),
+                    hovertemplate='%{x}<br>Band ' + band + ': %{y}<extra></extra>'
+                ))
+        
+        layout2 = create_figure_layout('Band Distribution by Department')
+        layout2['barmode'] = 'stack'
+        layout2['showlegend'] = True
+        layout2['legend'] = dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(color=TEXT_COLOR))
+        layout2['yaxis_title'] = 'Number of Employees'
+        fig2.update_layout(**layout2)
+        figures.append(f'<div class="chart-container">{fig2.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart2")}</div>')
+        
+        # Chart 3: Average Tenure by Band
+        tenure_by_band = active_employees.groupby('Band')['Tenure_Years'].mean().reindex(band_order)
+        
+        fig3 = go.Figure()
+        fig3.add_trace(go.Bar(
+            x=tenure_by_band.index,
+            y=tenure_by_band.values,
+            marker=dict(
+                color='#6366f1',
+                line=dict(color='#4f46e5', width=1)
+            ),
+            text=[f'{v:.1f}y' for v in tenure_by_band.values],
+            textposition='outside',
+            textfont=dict(color=TEXT_COLOR, size=12),
+            hovertemplate='Band %{x}<br>Avg Tenure: %{y:.1f} years<extra></extra>'
+        ))
+        
+        layout3 = create_figure_layout('Average Tenure by Band')
+        layout3['xaxis_title'] = 'Band'
+        layout3['yaxis_title'] = 'Average Tenure (Years)'
+        fig3.update_layout(**layout3)
+        figures.append(f'<div class="chart-container">{fig3.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart3")}</div>')
+    
+    elif dashboard_type == "demographics":
+        # Chart 1: Age Distribution
+        fig1 = go.Figure()
+        fig1.add_trace(go.Histogram(
+            x=active_employees['Age'],
+            nbinsx=15,
+            marker=dict(
+                color='#4a9eff',
+                line=dict(color='#2563eb', width=1)
+            ),
+            hovertemplate='Age: %{x}<br>Count: %{y}<extra></extra>'
+        ))
+        
+        layout1 = create_figure_layout('Age Distribution')
+        layout1['xaxis_title'] = 'Age'
+        layout1['yaxis_title'] = 'Number of Employees'
+        fig1.update_layout(**layout1)
+        figures.append(f'<div class="chart-container">{fig1.to_html(full_html=False, include_plotlyjs="cdn", config=plotly_config, div_id="chart1")}</div>')
+        
+        # Chart 2: Department Distribution
+        dept_counts = active_employees['Department'].value_counts()
+        
+        fig2 = go.Figure()
+        fig2.add_trace(go.Pie(
+            labels=dept_counts.index,
+            values=dept_counts.values,
+            hole=0.45,
+            marker=dict(colors=COLOR_SCHEME, line=dict(color='#0a1628', width=2)),
+            textfont=dict(color='white', size=12),
+            hovertemplate='%{label}<br>%{value} employees (%{percent})<extra></extra>'
+        ))
+        
+        layout2 = create_figure_layout('Employees by Department')
+        layout2['showlegend'] = True
+        layout2['legend'] = dict(orientation='v', yanchor='middle', y=0.5, xanchor='left', x=1.05, font=dict(color=TEXT_COLOR))
+        fig2.update_layout(**layout2)
+        figures.append(f'<div class="chart-container">{fig2.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart2")}</div>')
+        
+        # Chart 3: Top Locations
+        location_counts = active_employees['Work_Location'].value_counts().head(8).sort_values()
+        
+        fig3 = go.Figure()
+        fig3.add_trace(go.Bar(
+            y=location_counts.index,
+            x=location_counts.values,
+            orientation='h',
+            marker=dict(
+                color='#6366f1',
+                line=dict(color='#4f46e5', width=1)
+            ),
+            text=location_counts.values,
+            textposition='auto',
+            textfont=dict(color='white', size=12),
+            hovertemplate='%{y}<br>Employees: %{x}<extra></extra>'
+        ))
+        
+        layout3 = create_figure_layout('Top Work Locations')
+        layout3['yaxis'] = dict(color=TEXT_COLOR, showgrid=False)
+        layout3['xaxis_title'] = 'Number of Employees'
+        fig3.update_layout(**layout3)
+        figures.append(f'<div class="chart-container">{fig3.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart3")}</div>')
+    
+    elif dashboard_type == "location_compare":
+        # Chart 1: Employees by Location
+        location_counts = active_employees['Work_Location'].value_counts().head(10)
+        
+        fig1 = go.Figure()
+        fig1.add_trace(go.Bar(
+            x=location_counts.index,
+            y=location_counts.values,
+            marker=dict(
+                color=COLOR_SCHEME[:len(location_counts)],
+                line=dict(color='#1e3a8a', width=1)
+            ),
+            text=location_counts.values,
+            textposition='outside',
+            textfont=dict(color=TEXT_COLOR, size=11),
+            hovertemplate='%{x}<br>Employees: %{y}<extra></extra>'
+        ))
+        
+        layout1 = create_figure_layout('Employee Count by Location')
+        layout1['xaxis'] = dict(color=TEXT_COLOR, showgrid=False, tickangle=-45)
+        layout1['yaxis_title'] = 'Number of Employees'
+        fig1.update_layout(**layout1)
+        figures.append(f'<div class="chart-container">{fig1.to_html(full_html=False, include_plotlyjs="cdn", config=plotly_config, div_id="chart1")}</div>')
+        
+        # Chart 2: Department Mix by Top Locations
+        top_locations = location_counts.head(5).index
+        loc_dept_data = active_employees[active_employees['Work_Location'].isin(top_locations)]
+        loc_dept = loc_dept_data.groupby(['Work_Location', 'Department']).size().unstack(fill_value=0)
+        
+        fig2 = go.Figure()
+        for i, dept in enumerate(loc_dept.columns):
+            fig2.add_trace(go.Bar(
+                name=dept,
+                x=loc_dept.index,
+                y=loc_dept[dept],
+                marker_color=COLOR_SCHEME[i % len(COLOR_SCHEME)],
+                hovertemplate='%{x}<br>' + dept + ': %{y}<extra></extra>'
+            ))
+        
+        layout2 = create_figure_layout('Department Mix by Location')
+        layout2['barmode'] = 'stack'
+        layout2['showlegend'] = True
+        layout2['legend'] = dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(color=TEXT_COLOR))
+        layout2['xaxis'] = dict(color=TEXT_COLOR, showgrid=False, tickangle=-45)
+        layout2['yaxis_title'] = 'Number of Employees'
+        fig2.update_layout(**layout2)
+        figures.append(f'<div class="chart-container">{fig2.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart2")}</div>')
+        
+        # Chart 3: Average Tenure by Location
+        tenure_by_loc = active_employees.groupby('Work_Location')['Tenure_Years'].mean().sort_values(ascending=False).head(8)
+        
+        fig3 = go.Figure()
+        fig3.add_trace(go.Bar(
+            x=tenure_by_loc.index,
+            y=tenure_by_loc.values,
+            marker=dict(
+                color='#6366f1',
+                line=dict(color='#4f46e5', width=1)
+            ),
+            text=[f'{v:.1f}y' for v in tenure_by_loc.values],
+            textposition='outside',
+            textfont=dict(color=TEXT_COLOR, size=11),
+            hovertemplate='%{x}<br>Avg Tenure: %{y:.1f} years<extra></extra>'
+        ))
+        
+        layout3 = create_figure_layout('Average Tenure by Location')
+        layout3['xaxis'] = dict(color=TEXT_COLOR, showgrid=False, tickangle=-45)
+        layout3['yaxis_title'] = 'Average Tenure (Years)'
+        fig3.update_layout(**layout3)
+        figures.append(f'<div class="chart-container">{fig3.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart3")}</div>')
+    
+    else:  # general
+        # Chart 1: Department Overview
+        dept_counts = active_employees['Department'].value_counts()
+        
+        fig1 = go.Figure()
+        fig1.add_trace(go.Bar(
+            x=dept_counts.index,
+            y=dept_counts.values,
+            marker=dict(
+                color=COLOR_SCHEME[:len(dept_counts)],
+                line=dict(color='#1e3a8a', width=1)
+            ),
+            text=dept_counts.values,
+            textposition='outside',
+            textfont=dict(color=TEXT_COLOR, size=11),
+            hovertemplate='%{x}<br>Employees: %{y}<extra></extra>'
+        ))
+        
+        layout1 = create_figure_layout('Employees by Department')
+        layout1['xaxis'] = dict(color=TEXT_COLOR, showgrid=False)
+        layout1['yaxis_title'] = 'Number of Employees'
+        fig1.update_layout(**layout1)
+        figures.append(f'<div class="chart-container">{fig1.to_html(full_html=False, include_plotlyjs="cdn", config=plotly_config, div_id="chart1")}</div>')
+        
+        # Chart 2: Supervisory Organization Distribution
+        siglum_counts = active_employees['Supervisory_Organization_Siglum'].value_counts()
+        
+        fig2 = go.Figure()
+        fig2.add_trace(go.Pie(
+            labels=siglum_counts.index,
+            values=siglum_counts.values,
+            hole=0.45,
+            marker=dict(colors=COLOR_SCHEME, line=dict(color='#0a1628', width=2)),
+            textfont=dict(color='white', size=12),
+            hovertemplate='%{label}<br>%{value} employees (%{percent})<extra></extra>'
+        ))
+        
+        layout2 = create_figure_layout('Distribution by Supervisory Organization')
+        layout2['showlegend'] = True
+        layout2['legend'] = dict(orientation='v', yanchor='middle', y=0.5, xanchor='left', x=1.05, font=dict(color=TEXT_COLOR))
+        fig2.update_layout(**layout2)
+        figures.append(f'<div class="chart-container">{fig2.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart2")}</div>')
+        
+        # Chart 3: Top Locations
+        location_counts = active_employees['Work_Location'].value_counts().head(8).sort_values()
+        
+        fig3 = go.Figure()
+        fig3.add_trace(go.Bar(
+            y=location_counts.index,
+            x=location_counts.values,
+            orientation='h',
+            marker=dict(
+                color='#6366f1',
+                line=dict(color='#4f46e5', width=1)
+            ),
+            text=location_counts.values,
+            textposition='auto',
+            textfont=dict(color='white', size=12),
+            hovertemplate='%{y}<br>Employees: %{x}<extra></extra>'
+        ))
+        
+        layout3 = create_figure_layout('Employees by Location')
+        layout3['yaxis'] = dict(color=TEXT_COLOR, showgrid=False)
+        layout3['xaxis_title'] = 'Number of Employees'
+        fig3.update_layout(**layout3)
+        figures.append(f'<div class="chart-container">{fig3.to_html(full_html=False, include_plotlyjs=False, config=plotly_config, div_id="chart3")}</div>')
+        
+    # Combine all charts - they're already wrapped in divs with chart-grid class applied
+    if figures:
+        charts_html = '<div class="chart-grid">' + '\n'.join(figures) + '</div>'
+    else:
+        charts_html = "<p style='color: #9ca3af; text-align: center; padding: 40px;'>No visualizations available for this query</p>"
+        
+    # Build final dashboard HTML
+    time_period_display = f" - {time_period.title()}" if time_period else ""
+    
+    return f"""
+    <div class="dashboard-header">
+        <h2 class="dashboard-title">{parsed_query.get('focus', 'Dashboard').title()}{time_period_display}</h2>
+        <p class="dashboard-subtitle">Generated from {len(employees_df)} employee records</p>
+    </div>
+    
+    {kpi_html}
+    
+    {charts_html}
+    """
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "vertex_ai_enabled": VERTEX_AI_ENABLED
+    }
