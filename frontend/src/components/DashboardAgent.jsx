@@ -519,6 +519,8 @@ const DashboardAgent = () => {
   const [actionPanel, setActionPanel] = useState(null);
   const [genStep, setGenStep] = useState('');
   const [suggestions, setSuggestions] = useState([]);
+  const [schemaFields, setSchemaFields] = useState([]); // categorical fields from /api/schema
+  const [temporalFields, setTemporalFields] = useState([]); // temporal fields from /api/schema
   const [activeFilters, setActiveFilters] = useState([]); // [{field, options, selected}]
   const [openFilterDropdown, setOpenFilterDropdown] = useState(null);
   const msgEndRef = useRef(null);
@@ -528,6 +530,17 @@ const DashboardAgent = () => {
   const dashboard = activeChartData?.dashboard;
 
   useEffect(() => { msgEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [chats, loading]);
+
+  // Load schema once — populate filter fields and chart suggestions dynamically
+  useEffect(() => {
+    fetch(`${API_URL}/api/schema`)
+      .then(r => r.json())
+      .then(schema => {
+        setSchemaFields(schema.categorical_fields || []);
+        setTemporalFields(schema.temporal_fields || []);
+      })
+      .catch(() => {}); // silent — works without schema too
+  }, []);
 
   const LANDING_PROMPTS = [
     { icon: <TrendingUp className="w-4 h-4" />, label: 'Attrition & Retention', prompt: 'Analyze attrition trends and identify which groups have highest turnover risk' },
@@ -730,15 +743,43 @@ const DashboardAgent = () => {
     sendMessage(text, activeChat, activeChartData?.messages || []);
   };
 
+  // Chart suggestions built dynamically from the schema — no hardcoded field names
   const getChartSuggestions = () => {
     const existing = (dashboard?.visualizations || []).map(v => v.title.toLowerCase());
-    return [
-      'Headcount by Function over time', 'Gender distribution by Band',
-      'Active vs Inactive by Region', 'FTE by Worker Category',
-      'Contract Type distribution', 'Band level breakdown',
-      'Job Family Group comparison', 'Blue vs White Collar by Country',
-      'Headcount trend by Snapshot Month', 'Top Supervisory Orgs by size',
-    ].filter(s_ => !existing.some(e => e.includes(s_.split(' ')[0].toLowerCase()))).slice(0, 6);
+
+    // Use fields already discovered from schema (populated by addFilter calls)
+    // or fall back to fields used in current dashboard visualizations
+    const knownFields = [
+      ...new Set([
+        ...(dashboard?.visualizations || []).flatMap(v => v.fields || []),
+        ...schemaFields,
+      ])
+    ].filter(f => f && !f.includes('_ID') && !f.includes('Email') && !f.includes('SAP'));
+
+    if (knownFields.length === 0) {
+      return ['Add a chart comparing two dimensions', 'Show headcount trend over time',
+              'Break down by a categorical field', 'Add a table with detailed counts',
+              'Show distribution as a donut chart', 'Compare two groups side by side'];
+    }
+
+    // Build suggestions as "X by Y" combinations from actual field names
+    const suggestions = [];
+    for (let i = 0; i < knownFields.length && suggestions.length < 8; i++) {
+      for (let j = i + 1; j < knownFields.length && suggestions.length < 8; j++) {
+        const a = knownFields[i];
+        const b = knownFields[j];
+        suggestions.push(`${a} breakdown by ${b}`);
+        suggestions.push(`${b} distribution by ${a}`);
+      }
+    }
+    // Add time-series suggestion if temporal fields exist
+    if (temporalFields.length > 0) {
+      suggestions.push(`Headcount trend over ${temporalFields[0]}`);
+    }
+
+    return suggestions
+      .filter(s_ => !existing.some(e => e.includes(s_.split(' ')[0].toLowerCase())))
+      .slice(0, 6);
   };
 
   // ─── LANDING ─────────────────────────────────────────────────────────────
@@ -918,8 +959,11 @@ const DashboardAgent = () => {
               {actionPanel === 'add_filters' && (
                 <div style={{ padding: 9, borderBottom: `1px solid ${theme.border}`, background: theme.surfaceAlt }}>
                   <div style={{ fontSize: 10, fontWeight: 700, color: theme.text, marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.4px' }}>Add filter by field:</div>
+                  {schemaFields.length === 0 && (
+                    <div style={{ fontSize: 11, color: theme.textMuted, padding: '4px 0' }}>Loading fields from data…</div>
+                  )}
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                    {['Function','Reporting_Region','Band','Contract_Type','Snapshot_Year','Gender','Blue_White_Collar','Worker_Category'].map((f, i) => {
+                    {schemaFields.map((f, i) => {
                       const already = activeFilters.find(af => af.field === f);
                       return (
                         <button key={i} onClick={() => { if (!already) addFilter(f); }}
